@@ -27,42 +27,52 @@ find_openssl() {
     [ -x "$p" ] && { echo "$p"; return 0; }
   done
   command -v openssl >/dev/null 2>&1 && { command -v openssl; return 0; }
-  command -v find >/dev/null 2>&1 || return 1
-  f="$(find /opt /usr/local /usr -maxdepth 6 -type f -name openssl 2>/dev/null | head -n 1 || true)"
-  [ -n "$f" ] && [ -x "$f" ] && { echo "$f"; return 0; }
+  if command -v find >/dev/null 2>&1; then
+    f="$(find /opt /usr/local /usr -maxdepth 6 -type f -name openssl 2>/dev/null | head -n 1 || true)"
+    [ -n "$f" ] && [ -x "$f" ] && { echo "$f"; return 0; }
+  fi
   return 1
 }
 OPENSSL="$(find_openssl || true)"
-[ -n "$OPENSSL" ] || { echo "ERROR: openssl not found" 1>&2; exit 127; }
+[ -n "$OPENSSL" ] || { echo "ERROR: openssl not found in container" 1>&2; exit 127; }
 '
 
-get_groups() {
+get_groups_tokens() {
   docker run --rm "${IMG}" sh -lc "
-    set -e
     ${container_find_openssl}
-    out=\"\$(${container_find_openssl} ; \"\$OPENSSL\" list -groups 2>/dev/null || true)\"
-    echo \"\$out\" | sed -e 's/^[[:space:]]*//; s/[,:].*$//; s/[()]//g' \
-      | awk 'NF>0 {print \$1}' \
+    \"\$OPENSSL\" list -groups 2>/dev/null \
+      | sed -e 's/^[[:space:]]*//' -e 's/[,:].*$//' -e 's/[()]//g' \
+      | awk 'NF>0{print \$1}' \
       | grep -E '^[A-Za-z0-9._-]+$' \
       | sort -u
   " 2>/dev/null || true
 }
 
-select_groups() {
-  local groups="$1"
-  local classic pq
-  classic="$(echo "$groups" | grep -iE '^x25519$' | head -n1 || true)"
-  [ -z "$classic" ] && classic="$(echo "$groups" | grep -iE 'secp256r1|prime256v1|p-256|p256' | head -n1 || true)"
-  [ -z "$classic" ] && classic="$(echo "$groups" | head -n1 || true)"
-  pq="$(echo "$groups" | grep -iE 'mlkem|kyber|oqs' | head -n1 || true)"
-  echo "${classic}|${pq}"
+GROUPS="$(get_groups_tokens || true)"
+if [ -n "$GROUPS" ]; then
+  echo "Parsed group tokens (head):"
+  echo "$GROUPS" | head -n 30
+  echo
+else
+  echo "WARN: could not parse group tokens; will run with default negotiation."
+  echo
+fi
+
+pick_classic_group() {
+  local g
+  g="$(echo "$GROUPS" | grep -iE '^x25519$' | head -n1 || true)"
+  [ -z "$g" ] && g="$(echo "$GROUPS" | head -n1 || true)"
+  echo "$g"
+}
+
+pick_pq_group() {
+  echo "$GROUPS" | grep -iE 'mlkem|kyber|oqs' | head -n1 || true
 }
 
 wait_server_ready() {
   local tries=20 i=1
   while [ $i -le $tries ]; do
     if docker run --rm --network "$NET" "${IMG}" sh -lc "
-      set -e
       ${container_find_openssl}
       timeout 2s \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief </dev/null >/dev/null 2>&1
     "; then
@@ -76,8 +86,8 @@ wait_server_ready() {
 
 run_latency() {
   local label="$1"
-  local group="$2"     # 可为空
-  local providers="$3" # provider flags
+  local group="${2:-}"         # 可为空 => 不传 -groups
+  local providers="$3"
 
   echo "=== TLS latency: ${label} group=${group:-<default>} ==="
   echo "Providers: ${providers}"
@@ -112,52 +122,41 @@ run_latency() {
       ${container_find_openssl}
       command -v python3 >/dev/null 2>&1 || { echo 'ERROR: python3 not found' 1>&2; exit 127; }
 
-      GOPT=[]
-      grp='${group}'
-      if grp:
-        GOPT=['-groups', grp]
-
-      prov='${providers}'
-      prov_args=prov.split() if prov else []
-
       python3 - << 'PY'
 import os, subprocess, time, math, statistics
 
 N = int(os.environ.get('N','10'))
 TO = float(os.environ.get('ATTEMPT_TIMEOUT','2'))
-
 OPENSSL = os.environ['OPENSSL_BIN']
-PORT = '4433'
-# PROVIDERS/GROUP_ARGS 由外层注入
 PROV = os.environ.get('PROV','').split()
 GROUP = os.environ.get('GROUP','').strip()
 
-cmd = [OPENSSL,'s_client','-connect',f'server:{PORT}','-tls1_3','-brief']
+cmd = [OPENSSL,'s_client','-connect','server:4433','-tls1_3','-brief']
 if GROUP:
-  cmd += ['-groups', GROUP]
+    cmd += ['-groups', GROUP]
 cmd += PROV
 
 lats=[]
 ok=0
 fail=0
 for _ in range(N):
-  t0=time.time_ns()
-  try:
-    subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=TO, check=False)
-    t1=time.time_ns()
-    lats.append((t1-t0)/1e6)
-    ok += 1
-  except subprocess.TimeoutExpired:
-    fail += 1
+    t0=time.time_ns()
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=TO, check=False)
+        t1=time.time_ns()
+        lats.append((t1-t0)/1e6)
+        ok += 1
+    except subprocess.TimeoutExpired:
+        fail += 1
 
 lats.sort()
 def pct(p):
-  if not lats: return float('nan')
-  k=(len(lats)-1)*p/100.0
-  f=math.floor(k); c=math.ceil(k)
-  if f==c: return lats[int(k)]
-  return lats[f]*(c-k)+lats[c]*(k-f)
+    if not lats: return float('nan')
+    k=(len(lats)-1)*p/100.0
+    f=math.floor(k); c=math.ceil(k)
+    if f==c: return lats[int(k)]
+    return lats[f]*(c-k)+lats[c]*(k-f)
 
 sr = (ok*100.0/N) if N else float('nan')
 mean = statistics.mean(lats) if lats else float('nan')
@@ -171,24 +170,16 @@ PY
   echo
 }
 
-GROUPS="$(get_groups)"
-if [ -z "$GROUPS" ]; then
-  echo "WARN: could not parse any TLS groups. Falling back to default negotiation."
-  run_latency "default" "" "-provider default"
-  exit 0
+CLASSIC="$(pick_classic_group || true)"
+if [ -n "$CLASSIC" ]; then
+  run_latency "classic" "$CLASSIC" "-provider default"
+else
+  run_latency "classic_default" "" "-provider default"
 fi
 
-echo "Parsed groups (head):"
-echo "$GROUPS" | head -n 30
-echo
-
-sel="$(select_groups "$GROUPS")"
-CLASSIC="${sel%%|*}"
-PQ="${sel##*|}"
-
-run_latency "classic" "${CLASSIC}" "-provider default"
+PQ="$(pick_pq_group || true)"
 if [ -n "$PQ" ]; then
-  run_latency "pqc_or_hybrid" "${PQ}" "-provider oqsprovider -provider default"
+  run_latency "pqc_or_hybrid" "$PQ" "-provider oqsprovider -provider default"
 else
-  echo "NOTE: no pq/hybrid-looking group found; only classic baseline produced."
+  echo "NOTE: no pq/hybrid-looking group token found; done."
 fi
