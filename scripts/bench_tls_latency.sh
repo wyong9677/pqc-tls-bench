@@ -23,54 +23,45 @@ docker network create "$NET" >/dev/null
 
 container_find_openssl='
 find_openssl() {
-  for p in /opt/openssl32/bin/openssl /opt/openssl/bin/openssl /usr/local/bin/openssl /usr/bin/openssl /usr/local/ssl/bin/openssl; do
+  for p in /opt/openssl/bin/openssl /opt/openssl32/bin/openssl /usr/local/bin/openssl /usr/bin/openssl /usr/local/ssl/bin/openssl; do
     [ -x "$p" ] && { echo "$p"; return 0; }
   done
   command -v openssl >/dev/null 2>&1 && { command -v openssl; return 0; }
-  if command -v find >/dev/null 2>&1; then
-    f="$(find /opt /usr/local /usr -maxdepth 6 -type f -name openssl 2>/dev/null | head -n 1 || true)"
-    [ -n "$f" ] && [ -x "$f" ] && { echo "$f"; return 0; }
-  fi
   return 1
 }
 OPENSSL="$(find_openssl || true)"
 [ -n "$OPENSSL" ] || { echo "ERROR: openssl not found in container" 1>&2; exit 127; }
 '
 
-get_groups_tokens() {
+get_tls_groups() {
   docker run --rm "${IMG}" sh -lc "
     ${container_find_openssl}
-    \"\$OPENSSL\" list -groups 2>/dev/null \
-      | sed -e 's/^[[:space:]]*//' -e 's/[,:].*$//' -e 's/[()]//g' \
-      | awk 'NF>0{print \$1}' \
+    \"\$OPENSSL\" s_client -groups help 2>/dev/null \
+      | tr ',\\t' '  ' \
+      | tr -s ' ' '\n' \
+      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
       | grep -E '^[A-Za-z0-9._-]+$' \
+      | grep -viE '^(help|Supported|groups|named|default)$' \
       | sort -u
   " 2>/dev/null || true
 }
 
-GROUPS="$(get_groups_tokens || true)"
-if [ -n "$GROUPS" ]; then
-  echo "Parsed group tokens (head):"
-  echo "$GROUPS" | head -n 30
-  echo
-else
-  echo "WARN: could not parse group tokens; will run with default negotiation."
-  echo
-fi
+GROUPS="$(get_tls_groups || true)"
 
-pick_classic_group() {
-  local g
+pick_classic() {
+  local g=""
   g="$(echo "$GROUPS" | grep -iE '^x25519$' | head -n1 || true)"
+  [ -z "$g" ] && g="$(echo "$GROUPS" | grep -iE 'secp256r1|prime256v1|p-256|p256' | head -n1 || true)"
   [ -z "$g" ] && g="$(echo "$GROUPS" | head -n1 || true)"
   echo "$g"
 }
 
-pick_pq_group() {
-  echo "$GROUPS" | grep -iE 'mlkem|kyber|oqs' | head -n1 || true
+pick_pq_or_hybrid() {
+  echo "$GROUPS" | grep -iE 'mlkem|kyber' | head -n1 || true
 }
 
 wait_server_ready() {
-  local tries=20 i=1
+  local tries=25 i=1
   while [ $i -le $tries ]; do
     if docker run --rm --network "$NET" "${IMG}" sh -lc "
       ${container_find_openssl}
@@ -86,7 +77,7 @@ wait_server_ready() {
 
 run_latency() {
   local label="$1"
-  local group="${2:-}"         # 可为空 => 不传 -groups
+  local group="${2:-}"     # 可为空：默认协商
   local providers="$3"
 
   echo "=== TLS latency: ${label} group=${group:-<default>} ==="
@@ -115,71 +106,78 @@ run_latency() {
     exit 1
   fi
 
+  # 纯 shell：测 N 次并计算 p50/p95/p99/mean
   docker run --rm --network "$NET" \
     -e N="${N}" -e ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
     "${IMG}" sh -lc "
       set -e
       ${container_find_openssl}
-      command -v python3 >/dev/null 2>&1 || { echo 'ERROR: python3 not found' 1>&2; exit 127; }
 
-      python3 - << 'PY'
-import os, subprocess, time, math, statistics
+      n=\${N}
+      to=\${ATTEMPT_TIMEOUT}
 
-N = int(os.environ.get('N','10'))
-TO = float(os.environ.get('ATTEMPT_TIMEOUT','2'))
-OPENSSL = os.environ['OPENSSL_BIN']
-PROV = os.environ.get('PROV','').split()
-GROUP = os.environ.get('GROUP','').strip()
+      ok=0
+      fail=0
+      tmp=\$(mktemp)
+      : > \"\$tmp\"
 
-cmd = [OPENSSL,'s_client','-connect','server:4433','-tls1_3','-brief']
-if GROUP:
-    cmd += ['-groups', GROUP]
-cmd += PROV
+      i=1
+      while [ \$i -le \"\$n\" ]; do
+        t0=\$(date +%s%N)
+        if timeout \"\${to}s\" \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief \
+            ${providers} $( [ -n "${group}" ] && echo "-groups ${group}" ) \
+            </dev/null >/dev/null 2>&1; then
+          t1=\$(date +%s%N)
+          echo \$(( (t1 - t0)/1000000 )) >> \"\$tmp\"
+          ok=\$((ok+1))
+        else
+          fail=\$((fail+1))
+        fi
+        i=\$((i+1))
+      done
 
-lats=[]
-ok=0
-fail=0
-for _ in range(N):
-    t0=time.time_ns()
-    try:
-        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=TO, check=False)
-        t1=time.time_ns()
-        lats.append((t1-t0)/1e6)
-        ok += 1
-    except subprocess.TimeoutExpired:
-        fail += 1
+      cnt=\$(wc -l < \"\$tmp\" | tr -d \" \")
+      if [ \"\$cnt\" -eq 0 ]; then
+        echo \"attempts=\$n ok=0 failures=\$fail success_rate=0.0% (no successful handshakes)\"
+        rm -f \"\$tmp\"
+        exit 0
+      fi
 
-lats.sort()
-def pct(p):
-    if not lats: return float('nan')
-    k=(len(lats)-1)*p/100.0
-    f=math.floor(k); c=math.ceil(k)
-    if f==c: return lats[int(k)]
-    return lats[f]*(c-k)+lats[c]*(k-f)
+      sort -n \"\$tmp\" -o \"\$tmp\"
 
-sr = (ok*100.0/N) if N else float('nan')
-mean = statistics.mean(lats) if lats else float('nan')
-print(f'attempts={N} ok={ok} failures={fail} success_rate={sr:.1f}% '
-      f'ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={mean:.2f}')
-PY
-    " -e OPENSSL_BIN="$(docker run --rm "${IMG}" sh -lc "${container_find_openssl}; echo \"\$OPENSSL\"")" \
-      -e PROV="${providers}" \
-      -e GROUP="${group}"
+      # 索引：向上取整
+      pidx() { awk -v c=\"\$1\" -v p=\"\$2\" 'BEGIN{print int((c*p+99)/100)}'; }
+
+      p50=\$(sed -n \"\$(pidx \$cnt 50)p\" \"\$tmp\")
+      p95=\$(sed -n \"\$(pidx \$cnt 95)p\" \"\$tmp\")
+      p99=\$(sed -n \"\$(pidx \$cnt 99)p\" \"\$tmp\")
+      mean=\$(awk '{s+=\$1} END{printf \"%.2f\", s/NR}' \"\$tmp\")
+      sr=\$(awk -v ok=\"\$ok\" -v n=\"\$n\" 'BEGIN{printf \"%.1f\", (ok*100.0/n)}')
+
+      echo \"attempts=\$n ok=\$ok failures=\$fail success_rate=\${sr}% ms: p50=\${p50} p95=\${p95} p99=\${p99} mean=\${mean}\"
+      rm -f \"\$tmp\"
+    "
 
   echo
 }
 
-CLASSIC="$(pick_classic_group || true)"
-if [ -n "$CLASSIC" ]; then
-  run_latency "classic" "$CLASSIC" "-provider default"
-else
+if [ -z "$GROUPS" ]; then
+  echo "WARN: could not parse TLS groups from 's_client -groups help'. Running default negotiation only."
   run_latency "classic_default" "" "-provider default"
+  exit 0
 fi
 
-PQ="$(pick_pq_group || true)"
+echo "Parsed TLS group tokens (head):"
+echo "$GROUPS" | head -n 40
+echo
+
+CLASSIC="$(pick_classic || true)"
+PQ="$(pick_pq_or_hybrid || true)"
+
+[ -n "$CLASSIC" ] && run_latency "classic" "$CLASSIC" "-provider default" || run_latency "classic_default" "" "-provider default"
+
 if [ -n "$PQ" ]; then
   run_latency "pqc_or_hybrid" "$PQ" "-provider oqsprovider -provider default"
 else
-  echo "NOTE: no pq/hybrid-looking group token found; done."
+  echo "NOTE: no mlkem/kyber-looking TLS group found; only classic baseline produced."
 fi
