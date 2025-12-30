@@ -10,6 +10,7 @@ ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-2}"
 cleanup() {
   docker rm -f server >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
+  rm -f /tmp/tls_lat_okfail.log /tmp/tls_lat_ms.txt >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -60,18 +61,28 @@ if [ $i -gt $tries ]; then
   echo "ERROR: server not ready"
   echo "--- server logs (tail) ---"
   docker logs server 2>&1 | tail -n 200 || true
-  exit 1
+  # 仍输出“可用结果行”，避免文件不完整
+  echo "samples_collected=0 attempts=${N} ok=0 fail=${N} success_rate=0.0%"
+  echo "count=0 ms: p50=nan p95=nan p99=nan mean=nan (server not ready)"
+  echo
+  exit 0
 fi
 
-# 容器内采样：输出每次握手耗时(ms) + 统计 OK/FAIL（始终输出到 stderr）
-ms_list="$(
-  docker run --rm --network "$NET" -e N="$N" -e TO="$ATTEMPT_TIMEOUT" -e PORT="$PORT" "${IMG}" sh -lc '
+# host 侧文件（稳定）
+: > /tmp/tls_lat_ms.txt
+: > /tmp/tls_lat_okfail.log
+
+# 容器内采样：stdout 输出 ms（每行一个），stderr 输出 OK/FAIL
+docker run --rm --network "$NET" \
+  -e N="$N" -e TO="$ATTEMPT_TIMEOUT" -e PORT="$PORT" \
+  "${IMG}" sh -lc '
     set +e  # 采样阶段不因单次失败退出
     OPENSSL=/opt/openssl/bin/openssl
     [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
     if [ -z "$OPENSSL" ]; then
       echo "ERROR: openssl not found in container" 1>&2
-      exit 127
+      echo "OK=0 FAIL=${N} ATTEMPTS=${N}" 1>&2
+      exit 0
     fi
 
     n="${N}"
@@ -88,7 +99,6 @@ ms_list="$(
         if [ "$t0" != "0" ] && [ "$t1" != "0" ]; then
           echo $(( (t1 - t0)/1000000 ))
         else
-          # 极端情况下 date 不支持 %N，给一个占位值（避免空输出导致 host 侧误判）
           echo 0
         fi
         ok=$((ok+1))
@@ -100,50 +110,59 @@ ms_list="$(
 
     echo "OK=${ok} FAIL=${fail} ATTEMPTS=${n}" 1>&2
     exit 0
-  ' 2> /tmp/tls_lat_okfail.log || true
-)"
+  ' 1>>/tmp/tls_lat_ms.txt 2>>/tmp/tls_lat_okfail.log || true
 
-# 解析 OK/FAIL（保证总会输出一行摘要）
+# 解析 OK/FAIL（保证有值）
 ok="$(grep -Eo 'OK=[0-9]+' /tmp/tls_lat_okfail.log | tail -n1 | cut -d= -f2 || echo 0)"
 fail="$(grep -Eo 'FAIL=[0-9]+' /tmp/tls_lat_okfail.log | tail -n1 | cut -d= -f2 || echo 0)"
 attempts="$N"
-success_rate="$(python3 - <<PY
-ok=int(${ok}); n=int(${attempts})
-print(f"{(ok*100.0/n):.1f}" if n>0 else "nan")
-PY
-)"
 
-# 可观测性：输出采样条数
-sample_count="$(python3 - <<PY
-vals = [v for v in """${ms_list}""".split() if v.strip()!=""]
-print(len(vals))
-PY
-)"
+# 采样条数（以文件为准）
+sample_count="$(wc -l </tmp/tls_lat_ms.txt | tr -d ' ')"
+
+# success_rate（host python）
+success_rate="$(python3 -c "ok=int('${ok}'); n=int('${attempts}'); print(f'{(ok*100.0/n):.1f}' if n>0 else 'nan')")"
+
 echo "samples_collected=${sample_count} attempts=${attempts} ok=${ok} fail=${fail} success_rate=${success_rate}%"
 
-# 空/全失败也必须给出可用结果行（避免文件只有头部）
+# 如果没有成功样本，仍输出可用统计行
 if [ "${sample_count}" -eq 0 ] || [ "${ok}" -eq 0 ]; then
   echo "count=0 ms: p50=nan p95=nan p99=nan mean=nan (no successful handshakes)"
   echo
   exit 0
 fi
 
-# host python3 统计分位数（保证输出一行统计）
-python3 - <<'PY' <<<"${ms_list}"
-import sys, math, statistics
+# 统计（从文件读，稳定输出一行）
+export TLS_LAT_FILE="/tmp/tls_lat_ms.txt"
+python3 -c '
+import os, math, statistics
 
-vals = [float(x) for x in sys.stdin.read().split() if x.strip() != ""]
+path=os.environ["TLS_LAT_FILE"]
+vals=[]
+with open(path,"r",encoding="utf-8") as f:
+    for line in f:
+        line=line.strip()
+        if not line: 
+            continue
+        try:
+            vals.append(float(line))
+        except:
+            pass
+
 vals.sort()
+if not vals:
+    print("count=0 ms: p50=nan p95=nan p99=nan mean=nan (no parsable samples)")
+    raise SystemExit(0)
 
 def pct(p):
-    k = (len(vals)-1) * p / 100.0
-    f = math.floor(k); c = math.ceil(k)
-    if f == c:
+    k=(len(vals)-1)*p/100.0
+    f=math.floor(k); c=math.ceil(k)
+    if f==c:
         return vals[int(k)]
-    return vals[f] * (c-k) + vals[c] * (k-f)
+    return vals[f]*(c-k)+vals[c]*(k-f)
 
-mean = statistics.mean(vals)
+mean=statistics.mean(vals)
 print(f"count={len(vals)} ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={mean:.2f}")
-PY
+'
 
 echo
