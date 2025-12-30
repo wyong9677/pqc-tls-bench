@@ -5,12 +5,30 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    env:
+      # 关键：不要用 latest。先固定一个版本号 tag（后续可再调整）
+      IMG: openquantumsafe/oqs-ossl3:0.12.0
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Pull OQS OpenSSL image
         run: |
-          docker pull openquantumsafe/oqs-ossl3:latest
+          docker pull "${IMG}"
+
+      - name: Sanity check: openssl inside container
+        run: |
+          echo "Using image: ${IMG}"
+          docker run --rm "${IMG}" sh -lc 'command -v openssl && openssl version -a'
+          # python3 不强制要求；如果没有，就不要在脚本里依赖 python
+          docker run --rm "${IMG}" sh -lc 'command -v python3 || true'
+
+      - name: List repo files (debug)
+        run: |
+          echo "=== repo root ==="
+          ls -la
+          echo "=== scripts dir ==="
+          ls -la scripts || true
 
       - name: Make scripts executable
         run: |
@@ -33,6 +51,7 @@ jobs:
           bash scripts/bench_sig.sh | tee sig_bench.txt
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pqc-bench-results
