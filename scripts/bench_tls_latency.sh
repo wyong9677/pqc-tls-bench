@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMG="openquantumsafe/oqs-ossl3:latest"
+IMG="openquantumsafe/oqs-ossl3:0.12.0"
 NET="pqcnet"
 PORT=4433
-N="${N:-100}"
+N="${N:-50}"
 
 GROUPS=("X25519")
 
@@ -32,27 +32,31 @@ for g in "${GROUPS[@]}"; do
 
   sleep 1
 
+  # 采样 N 次握手耗时（毫秒）
   docker run --rm --network "$NET" "$IMG" sh -lc "
-python3 - << 'PY'
-import subprocess, time, statistics, math
-N=int('${N}')
-cmd=['openssl','s_client','-connect','server:${PORT}','-tls1_3',
-     '-provider','oqsprovider','-provider','default','-brief']
-l=[]
-for _ in range(N):
-    t0=time.time_ns()
-    subprocess.run(cmd, input=b'', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    t1=time.time_ns()
-    l.append((t1-t0)/1e6)
-l.sort()
-def pct(p):
-    k=(len(l)-1)*p/100.0
-    f=math.floor(k); c=math.ceil(k)
-    if f==c: return l[int(k)]
-    return l[f]*(c-k)+l[c]*(k-f)
-print(f'count={len(l)} ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={statistics.mean(l):.2f}')
-PY
-  "
+    i=1
+    while [ \$i -le $N ]; do
+      t0=\$(date +%s%N)
+      echo | openssl s_client -connect server:$PORT -tls1_3 \
+        -provider oqsprovider -provider default -brief >/dev/null 2>&1 || true
+      t1=\$(date +%s%N)
+      echo \$(( (t1 - t0)/1000000 ))
+      i=\$((i+1))
+    done
+  " | sort -n > /tmp/lats_ms.txt
+
+  count=$(wc -l < /tmp/lats_ms.txt)
+  p50_idx=$(( (count*50 + 99)/100 ))
+  p95_idx=$(( (count*95 + 99)/100 ))
+  p99_idx=$(( (count*99 + 99)/100 ))
+
+  p50=$(sed -n "${p50_idx}p" /tmp/lats_ms.txt)
+  p95=$(sed -n "${p95_idx}p" /tmp/lats_ms.txt)
+  p99=$(sed -n "${p99_idx}p" /tmp/lats_ms.txt)
+
+  mean=$(awk '{s+=$1} END{if(NR>0) printf "%.2f", s/NR; else print "nan"}' /tmp/lats_ms.txt)
+
+  echo "count=$count ms: p50=$p50 p95=$p95 p99=$p99 mean=$mean"
   echo
 done
 
