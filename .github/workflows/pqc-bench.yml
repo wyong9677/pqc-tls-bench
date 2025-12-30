@@ -6,6 +6,9 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    env:
+      # 先用 latest 跑通；跑通后可改成固定 tag 或 digest
+      IMG: openquantumsafe/oqs-ossl3:latest
 
     steps:
       - name: Checkout
@@ -14,7 +17,6 @@ jobs:
 
       - name: Prepare output files
         run: |
-          # 无论后续发生什么，先把文件创建出来，确保 artifacts 一定有东西可上传
           : > env_info.txt
           : > tls_bench.txt
           : > tls_latency.txt
@@ -34,17 +36,69 @@ jobs:
 
       - name: Pull OQS image
         run: |
-          IMG="openquantumsafe/oqs-ossl3:0.12.0"
-          echo "Pulling $IMG" | tee -a env_info.txt
-          docker pull "$IMG" 2>&1 | tee -a env_info.txt
+          echo "Pulling ${IMG}" | tee -a env_info.txt
+          docker pull "${IMG}" 2>&1 | tee -a env_info.txt
+        continue-on-error: true
+
+      - name: Probe OPENSSL_BIN in container
+        run: |
+          echo "=== Probe OPENSSL_BIN ===" | tee -a env_info.txt
+          echo "IMG=${IMG}" | tee -a env_info.txt
+
+          OPENSSL_BIN="$(docker run --rm "${IMG}" sh -lc '
+            for p in \
+              /usr/local/bin/openssl \
+              /usr/bin/openssl \
+              /opt/openssl/bin/openssl \
+              /opt/oqs/bin/openssl \
+              /opt/local/bin/openssl \
+              /usr/local/ssl/bin/openssl
+            do
+              if [ -x "$p" ]; then
+                echo "$p"
+                exit 0
+              fi
+            done
+            if command -v openssl >/dev/null 2>&1; then
+              echo openssl
+              exit 0
+            fi
+            exit 1
+          ' 2>/dev/null || true)"
+
+          if [ -z "${OPENSSL_BIN}" ]; then
+            echo "ERROR: cannot find openssl in container (OPENSSL_BIN is empty)" | tee -a env_info.txt
+            # 继续执行以便上传日志
+            OPENSSL_BIN=openssl
+          fi
+
+          echo "OPENSSL_BIN=${OPENSSL_BIN}" | tee -a env_info.txt
+          echo "OPENSSL_BIN=${OPENSSL_BIN}" >> "${GITHUB_ENV}"
         continue-on-error: true
 
       - name: Sanity check in container
         run: |
-          IMG="openquantumsafe/oqs-ossl3:0.12.0"
           echo "=== Sanity check: openssl/python ===" | tee -a env_info.txt
-          docker run --rm "$IMG" sh -lc 'uname -a; command -v openssl; openssl version -a' 2>&1 | tee -a env_info.txt
-          docker run --rm "$IMG" sh -lc 'command -v python3 || true' 2>&1 | tee -a env_info.txt
+          echo "IMG=${IMG}" | tee -a env_info.txt
+          echo "OPENSSL_BIN=${OPENSSL_BIN}" | tee -a env_info.txt
+
+          docker run --rm "${IMG}" sh -lc "
+            uname -a || true
+            echo
+            if [ -x \"${OPENSSL_BIN}\" ] || command -v \"${OPENSSL_BIN}\" >/dev/null 2>&1; then
+              \"${OPENSSL_BIN}\" version -a || true
+              echo
+              \"${OPENSSL_BIN}\" list -providers || true
+              echo
+              \"${OPENSSL_BIN}\" list -groups 2>/dev/null | head -n 80 || true
+            else
+              echo 'ERROR: OPENSSL_BIN not found in container'
+              exit 1
+            fi
+          " 2>&1 | tee -a env_info.txt
+
+          # python3 不强制；latency 脚本不依赖 python
+          docker run --rm "${IMG}" sh -lc 'command -v python3 || true' 2>&1 | tee -a env_info.txt
         continue-on-error: true
 
       - name: Make scripts executable
@@ -54,22 +108,22 @@ jobs:
 
       - name: Environment info
         run: |
-          bash scripts/env_info.sh 2>&1 | tee -a env_info.txt || true
+          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" bash scripts/env_info.sh 2>&1 | tee -a env_info.txt || true
         continue-on-error: true
 
       - name: TLS handshake throughput
         run: |
-          bash scripts/bench_tls.sh 2>&1 | tee -a tls_bench.txt || true
+          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" bash scripts/bench_tls.sh 2>&1 | tee -a tls_bench.txt || true
         continue-on-error: true
 
       - name: TLS handshake latency
         run: |
-          bash scripts/bench_tls_latency.sh 2>&1 | tee -a tls_latency.txt || true
+          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" bash scripts/bench_tls_latency.sh 2>&1 | tee -a tls_latency.txt || true
         continue-on-error: true
 
       - name: Signature benchmark
         run: |
-          bash scripts/bench_sig.sh 2>&1 | tee -a sig_bench.txt || true
+          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" bash scripts/bench_sig.sh 2>&1 | tee -a sig_bench.txt || true
         continue-on-error: true
 
       - name: Upload results
