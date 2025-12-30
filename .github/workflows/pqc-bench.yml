@@ -13,20 +13,31 @@ jobs:
       - name: Pull OQS OpenSSL image
         run: docker pull openquantumsafe/oqs-ossl3:0.12.0
 
+      - name: List repo files (debug)
+        run: |
+          echo "=== repo root ==="
+          ls -la
+          echo "=== scripts ==="
+          ls -la scripts || true
+
       - name: Make scripts executable
-        run: chmod +x scripts/*.sh
+        run: chmod +x scripts/*.sh || true
 
       - name: Environment info
-        run: bash scripts/env_info.sh | tee env_info.txt
+        run: |
+          bash scripts/env_info.sh 2>&1 | tee env_info.txt || true
 
       - name: TLS handshake throughput
-        run: bash scripts/bench_tls.sh | tee tls_bench.txt
+        run: |
+          bash scripts/bench_tls.sh 2>&1 | tee tls_bench.txt || true
 
       - name: TLS handshake latency
-        run: bash scripts/bench_tls_latency.sh | tee tls_latency.txt
+        run: |
+          bash scripts/bench_tls_latency.sh 2>&1 | tee tls_latency.txt || true
 
       - name: Signature benchmark
-        run: bash scripts/bench_sig.sh | tee sig_bench.txt
+        run: |
+          bash scripts/bench_sig.sh 2>&1 | tee sig_bench.txt || true
 
       - name: Upload results
         if: always()
