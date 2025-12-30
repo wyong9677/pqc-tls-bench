@@ -20,41 +20,50 @@ echo "=== Docker ==="
 docker --version || true
 echo
 
-echo "=== Container sanity check ==="
+echo "=== Container sanity check (single run) ==="
 echo "Image: ${IMG}"
-echo "OPENSSL_BIN: ${OPENSSL_BIN}"
+echo "Requested OPENSSL_BIN: ${OPENSSL_BIN}"
 echo
 
-docker run --rm \
-  -e OPENSSL_BIN="${OPENSSL_BIN}" \
-  "${IMG}" sh -lc '
-    echo "OPENSSL_BIN inside container: $OPENSSL_BIN"
+docker run --rm -e OPENSSL_BIN="${OPENSSL_BIN}" "${IMG}" sh -lc '
+  set -e
 
-    # 如果是绝对路径，打印一下文件信息，方便排错
-    case "$OPENSSL_BIN" in
-      /*) ls -l "$OPENSSL_BIN" 2>/dev/null || true ;;
-    esac
-
-    if [ -x "$OPENSSL_BIN" ] || command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
-      "$OPENSSL_BIN" version -a | head -n 60
-    else
-      echo "ERROR: cannot execute OPENSSL_BIN inside container: $OPENSSL_BIN"
-      exit 1
+  pick_openssl() {
+    # 1) 用户指定的 OPENSSL_BIN
+    if [ -n "${OPENSSL_BIN:-}" ]; then
+      if [ -x "$OPENSSL_BIN" ] || command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
+        echo "$OPENSSL_BIN"
+        return 0
+      fi
     fi
-  '
-echo
+    # 2) fallback: openssl
+    if command -v openssl >/dev/null 2>&1; then
+      echo "openssl"
+      return 0
+    fi
+    return 1
+  }
 
-echo "=== Providers (inside container) ==="
-docker run --rm \
-  -e OPENSSL_BIN="${OPENSSL_BIN}" \
-  "${IMG}" sh -lc '
-    "$OPENSSL_BIN" list -providers || true
-  '
-echo
+  BIN="$(pick_openssl || true)"
+  if [ -z "$BIN" ]; then
+    echo "ERROR: cannot find openssl binary in container."
+    exit 1
+  fi
 
-echo "=== TLS Groups (inside container) ==="
-docker run --rm \
-  -e OPENSSL_BIN="${OPENSSL_BIN}" \
-  "${IMG}" sh -lc '
-    "$OPENSSL_BIN" list -groups 2>/dev/null | head -n 200 || true
-  '
+  echo "OPENSSL_BIN inside container: $BIN"
+  case "$BIN" in
+    /*) ls -l "$BIN" 2>/dev/null || true ;;
+  esac
+  echo
+
+  echo "== openssl version (head) =="
+  "$BIN" version -a 2>/dev/null | head -n 40 || true
+  echo
+
+  echo "== providers =="
+  "$BIN" list -providers 2>/dev/null || true
+  echo
+
+  echo "== tls groups (head) =="
+  "$BIN" list -groups 2>/dev/null | head -n 120 || true
+'
