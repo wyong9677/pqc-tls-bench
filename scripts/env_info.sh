@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 从 workflow 读取 IMG；不要用 latest
-IMG="${IMG:-openquantumsafe/oqs-ossl3:0.12.0}"
+# 镜像由 workflow 控制；默认用 latest（保证能 pull）
+IMG="${IMG:-openquantumsafe/oqs-ossl3:latest}"
+
+# openssl 真实路径由 workflow Probe step 写入；默认尝试 openssl
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 
 echo "=== Host ==="
 uname -a || true
@@ -22,23 +25,26 @@ echo
 
 echo "=== Container sanity check ==="
 echo "Image: ${IMG}"
-docker run --rm "${IMG}" sh -lc '
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "ERROR: openssl not found inside container"
+echo "OPENSSL_BIN: ${OPENSSL_BIN}"
+
+docker run --rm "${IMG}" sh -lc "
+  if [ -x \"${OPENSSL_BIN}\" ] || command -v \"${OPENSSL_BIN}\" >/dev/null 2>&1; then
+    echo \"OPENSSL_BIN inside container: ${OPENSSL_BIN}\"
+    \"${OPENSSL_BIN}\" version -a | head -n 40
+  else
+    echo 'ERROR: cannot execute OPENSSL_BIN inside container'
     exit 1
   fi
-  command -v openssl
-  openssl version -a
-'
+"
 echo
 
 echo "=== Providers (inside container) ==="
-docker run --rm "${IMG}" sh -lc '
-  openssl list -providers || true
-'
+docker run --rm "${IMG}" sh -lc "
+  \"${OPENSSL_BIN}\" list -providers || true
+"
 echo
 
 echo "=== TLS Groups (inside container) ==="
-docker run --rm "${IMG}" sh -lc '
-  openssl list -groups 2>/dev/null | head -n 200 || true
-'
+docker run --rm "${IMG}" sh -lc "
+  \"${OPENSSL_BIN}\" list -groups 2>/dev/null | head -n 200 || true
+"
