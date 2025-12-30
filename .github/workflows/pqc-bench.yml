@@ -13,7 +13,7 @@ jobs:
       # 冒烟测试参数：先跑通、先出结果
       TIMESEC: "5"        # openssl s_time 运行秒数
       N: "10"             # latency 采样次数
-      BENCH_SECONDS: "2"  # openssl speed 秒数
+      BENCH_SECONDS: "2"  # 签名基准秒数（如脚本仍用 speed）
 
     steps:
       - name: Checkout
@@ -21,7 +21,7 @@ jobs:
 
       - name: Show repo layout
         run: |
-          set -e
+          set -euo pipefail
           pwd
           ls -la
           ls -la scripts || true
@@ -29,43 +29,45 @@ jobs:
       - name: Pull OQS image
         timeout-minutes: 3
         run: |
-          set -e
+          set -euo pipefail
           docker pull "${IMG}"
 
       - name: Container sanity (openssl/providers/groups)
         timeout-minutes: 2
         run: |
-          set -e
+          set -euo pipefail
           docker run --rm "${IMG}" sh -lc '
             set -e
             uname -a || true
             echo "== openssl ==" && openssl version -a
+            echo
             echo "== providers ==" && openssl list -providers || true
-            echo "== groups (head) ==" && (openssl list -groups 2>/dev/null | head -n 80 || true)
-          ' | tee env_info.txt
+            echo
+            echo "== groups (head) ==" && (openssl list -groups 2>/dev/null | head -n 120 || true)
+          ' |& tee env_info.txt
 
       - name: Make scripts executable
         run: |
-          set -e
+          set -euo pipefail
           chmod +x scripts/*.sh
 
       - name: TLS handshake throughput (smoke)
         timeout-minutes: 2
         run: |
-          set -e
-          IMG="${IMG}" TIMESEC="${TIMESEC}" bash scripts/bench_tls.sh | tee tls_bench.txt
+          set -euo pipefail
+          IMG="${IMG}" TIMESEC="${TIMESEC}" bash scripts/bench_tls.sh |& tee tls_bench.txt
 
       - name: TLS handshake latency (smoke)
         timeout-minutes: 2
         run: |
-          set -e
-          IMG="${IMG}" N="${N}" bash scripts/bench_tls_latency.sh | tee tls_latency.txt
+          set -euo pipefail
+          IMG="${IMG}" N="${N}" bash scripts/bench_tls_latency.sh |& tee tls_latency.txt
 
       - name: Signature benchmark (smoke)
         timeout-minutes: 2
         run: |
-          set -e
-          IMG="${IMG}" BENCH_SECONDS="${BENCH_SECONDS}" bash scripts/bench_sig.sh | tee sig_bench.txt
+          set -euo pipefail
+          IMG="${IMG}" BENCH_SECONDS="${BENCH_SECONDS}" bash scripts/bench_sig.sh |& tee sig_bench.txt
 
       - name: Upload results
         if: always()
