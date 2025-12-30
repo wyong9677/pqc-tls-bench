@@ -5,8 +5,6 @@ IMG="openquantumsafe/oqs-ossl3:latest"
 NET="pqcnet"
 PORT="4433"
 TIMESEC="20"
-
-# 先跑经典与混合两组（混合组名若不支持，会在日志里看到可用列表）
 GROUPS=("X25519" "X25519MLKEM768")
 
 echo "=== OpenSSL & provider info ==="
