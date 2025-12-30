@@ -13,34 +13,41 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     env:
-      IMG: openquantumsafe/oqs-ossl3:latest
+      IMG_BASE: openquantumsafe/oqs-ossl3:latest
       RESULTS_DIR: results
 
-      # 默认给 paper；smoke 会在脚本里自动覆盖为更小值
-      REPEATS: "5"
+      # paper 默认（脚本内会按 mode 自动缩小 smoke 参数）
+      REPEATS: "7"
       WARMUP: "2"
-      TIMESEC: "15"          # s_time duration
-      N: "200"               # latency samples per repeat
-      ATTEMPT_TIMEOUT: "3"   # seconds per handshake attempt
-      BENCH_SECONDS: "15"    # openssl speed seconds
+      TIMESEC: "20"          # throughput window
+      N: "300"               # latency samples per repeat
+      ATTEMPT_TIMEOUT: "3"   # handshake timeout
+      BENCH_SECONDS: "20"    # openssl speed seconds
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Python (host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Prepare dirs
         run: |
           set -euo pipefail
           mkdir -p "${RESULTS_DIR}"
 
-      - name: Pull image
+      - name: Pull base image and lock digest
         run: |
           set -euo pipefail
-          docker pull "${IMG}"
-          echo "=== RepoDigests ===" | tee "${RESULTS_DIR}/image_digest.txt"
-          docker inspect --format='{{join .RepoDigests "\n"}}' "${IMG}" | tee -a "${RESULTS_DIR}/image_digest.txt"
+          docker pull "${IMG_BASE}"
+          # pick first repodigest as the locked ref
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG_BASE}")"
+          echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
+          echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
 
       - name: Make scripts executable
         run: |
@@ -58,26 +65,27 @@ jobs:
           set -euo pipefail
           MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
-            bash scripts/bench_tls.sh |& tee "${RESULTS_DIR}/tls_throughput.txt"
+            bash scripts/bench_tls_throughput.sh |& tee "${RESULTS_DIR}/tls_throughput.txt"
 
-      - name: TLS latency (paper-grade, raw + adjusted, repeated)
+      - name: TLS latency (paper-grade, repeated, raw samples)
         run: |
           set -euo pipefail
           MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-            bash scripts/bench_tls_latency.sh |& tee "${RESULTS_DIR}/tls_latency.txt"
+            bash scripts/bench_tls_latency_paper.sh |& tee "${RESULTS_DIR}/tls_latency.txt"
 
-      - name: Signature benchmark (repeated)
+      - name: Signature benchmark (repeated, raw outputs)
         run: |
           set -euo pipefail
           MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" \
-            bash scripts/bench_sig.sh |& tee "${RESULTS_DIR}/sig_bench.txt"
+            bash scripts/bench_sig_paper.sh |& tee "${RESULTS_DIR}/sig_bench.txt"
 
-      - name: Summarize to paper tables
+      - name: Summarize results to paper tables (mean/std + 95% CI)
         run: |
           set -euo pipefail
-          python3 scripts/summarize_results.py "${RESULTS_DIR}" | tee "${RESULTS_DIR}/paper_tables.md"
+          python3 scripts/summarize_results_paper.py "${RESULTS_DIR}" \
+            | tee "${RESULTS_DIR}/paper_tables.md"
 
       - name: Upload results
         if: always()
