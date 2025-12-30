@@ -1,17 +1,13 @@
-name: PQC TLS Handshake Benchmark
+name: sanity-check
+
 on:
   workflow_dispatch:
 
 jobs:
-  bench:
+  hello:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Pull OQS OpenSSL image
-        run: docker pull openquantumsafe/oqs-ossl3:latest
-
-      - name: Run TLS handshake benchmark
+      - name: hello
         run: |
-          chmod +x scripts/bench_tls.sh
-          scripts/bench_tls.sh
+          echo "actions ok"
+          date
