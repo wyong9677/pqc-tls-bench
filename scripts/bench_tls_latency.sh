@@ -13,10 +13,9 @@ GROUPS=("X25519")
 echo "=== bench_tls_latency.sh ==="
 echo "Image: ${IMG}"
 echo "OPENSSL_BIN: ${OPENSSL_BIN}"
-echo "N: ${N}"
+echo "Attempts (N): ${N}"
 echo
 
-# --- Sanity check (container) ---
 docker run --rm -e OPENSSL_BIN="${OPENSSL_BIN}" "${IMG}" sh -lc '
   if [ -x "$OPENSSL_BIN" ] || command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
     "$OPENSSL_BIN" version -a >/dev/null 2>&1 || true
@@ -52,7 +51,7 @@ wait_server_ready() {
 }
 
 for g in "${GROUPS[@]}"; do
-  echo "=== TLS latency distribution: $g (N=$N) ==="
+  echo "=== TLS latency: group=${g} attempts=${N} ==="
 
   docker rm -f server >/dev/null 2>&1 || true
   docker run -d --rm --name server --network "$NET" \
@@ -74,16 +73,15 @@ for g in "${GROUPS[@]}"; do
     exit 1
   fi
 
-  # 采样 N 次握手耗时（毫秒）。失败的握手不计入样本，但会统计失败数。
+  # 固定尝试 N 次：成功则输出耗时(ms)；失败只计数
   docker run --rm --network "$NET" \
     -e OPENSSL_BIN="${OPENSSL_BIN}" \
     "$IMG" sh -lc "
       ok=0
       fail=0
-      while [ \$ok -lt ${N} ]; do
+      i=1
+      while [ \$i -le ${N} ]; do
         t0=\$(date +%s%N)
-
-        # 单次握手强制 3 秒超时，避免 CI 卡住
         if timeout 3s sh -lc 'echo | \"\$OPENSSL_BIN\" s_client -connect server:${PORT} -tls1_3 \
               -provider oqsprovider -provider default -brief >/dev/null 2>&1'; then
           t1=\$(date +%s%N)
@@ -92,19 +90,22 @@ for g in "${GROUPS[@]}"; do
         else
           fail=\$((fail+1))
         fi
-
-        # 防止偶发抖动导致死循环
-        if [ \$fail -gt 50 ]; then
-          echo \"ERROR: too many handshake failures (\$fail)\" 1>&2
-          exit 2
-        fi
+        i=\$((i+1))
       done
-      echo \"FAILURES=\$fail\" 1>&2
-    " 2> /tmp/failures.log | sort -n > /tmp/lats_ms.txt
+      echo \"OK=\$ok FAIL=\$fail\" 1>&2
+    " 2> /tmp/okfail.log | sort -n > /tmp/lats_ms.txt
 
-  failures=$(grep -Eo 'FAILURES=[0-9]+' /tmp/failures.log | tail -n1 | cut -d= -f2 || echo "0")
+  ok=$(grep -Eo 'OK=[0-9]+' /tmp/okfail.log | tail -n1 | cut -d= -f2 || echo "0")
+  failures=$(grep -Eo 'FAIL=[0-9]+' /tmp/okfail.log | tail -n1 | cut -d= -f2 || echo "0")
 
   count=$(wc -l < /tmp/lats_ms.txt)
+
+  if [ "$count" -eq 0 ]; then
+    echo "attempts=${N} ok=0 failures=${failures} (no successful handshakes)"
+    echo
+    continue
+  fi
+
   p50_idx=$(( (count*50 + 99)/100 ))
   p95_idx=$(( (count*95 + 99)/100 ))
   p99_idx=$(( (count*99 + 99)/100 ))
@@ -115,7 +116,10 @@ for g in "${GROUPS[@]}"; do
 
   mean=$(awk '{s+=$1} END{if(NR>0) printf "%.2f", s/NR; else print "nan"}' /tmp/lats_ms.txt)
 
-  echo "count=$count failures=$failures ms: p50=$p50 p95=$p95 p99=$p99 mean=$mean"
+  # 成功率（百分比）
+  success_rate=$(awk -v ok="$ok" -v n="${N}" 'BEGIN{ if(n>0) printf "%.1f", (ok*100.0/n); else print "nan"; }')
+
+  echo "attempts=${N} ok=${ok} failures=${failures} success_rate=${success_rate}% ms: p50=${p50} p95=${p95} p99=${p99} mean=${mean}"
   echo
 done
 
