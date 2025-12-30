@@ -9,11 +9,9 @@ jobs:
     timeout-minutes: 8
     env:
       IMG: openquantumsafe/oqs-ossl3:latest
-
-      # 冒烟测试参数：先跑通、先出结果
-      TIMESEC: "5"        # openssl s_time 运行秒数
+      TIMESEC: "5"        # s_time 秒数（吞吐）
       N: "10"             # latency 采样次数
-      BENCH_SECONDS: "2"  # 签名基准秒数（如脚本仍用 speed）
+      BENCH_SECONDS: "2"  # 签名循环秒数
 
     steps:
       - name: Checkout
@@ -32,19 +30,11 @@ jobs:
           set -euo pipefail
           docker pull "${IMG}"
 
-      - name: Container sanity (openssl/providers/groups)
+      - name: Env info (host + container)
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          docker run --rm "${IMG}" sh -lc '
-            set -e
-            uname -a || true
-            echo "== openssl ==" && openssl version -a
-            echo
-            echo "== providers ==" && openssl list -providers || true
-            echo
-            echo "== groups (head) ==" && (openssl list -groups 2>/dev/null | head -n 120 || true)
-          ' |& tee env_info.txt
+          IMG="${IMG}" bash scripts/env_info.sh |& tee env_info.txt
 
       - name: Make scripts executable
         run: |
