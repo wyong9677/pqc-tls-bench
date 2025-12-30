@@ -4,11 +4,10 @@ set -euo pipefail
 IMG="${IMG:-openquantumsafe/oqs-ossl3:latest}"
 NET="pqcnet"
 PORT=4433
-N="${N:-10}"          # 冒烟默认 10
-ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-2}"  # 单次握手 timeout（秒）
+N="${N:-10}"
+ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-2}"
 
-# classic + (可用则跑) hybrid
-GROUPS=("X25519" "X25519MLKEM768")
+CANDIDATE_GROUPS=("X25519" "X25519MLKEM768" "SecP256r1MLKEM768" "MLKEM768")
 
 cleanup() {
   docker rm -f server >/dev/null 2>&1 || true
@@ -16,14 +15,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== bench_tls_latency.sh (smoke) ==="
+echo "=== bench_tls_latency.sh ==="
 echo "Image: ${IMG}"
-echo "Attempts (N): ${N}"
-echo "Attempt timeout: ${ATTEMPT_TIMEOUT}s"
+echo "N: ${N}  attempt_timeout: ${ATTEMPT_TIMEOUT}s"
 echo
 
-# Sanity: openssl in container
-docker run --rm "${IMG}" sh -lc 'command -v openssl >/dev/null 2>&1; openssl version -a >/dev/null 2>&1 || true'
+docker run --rm "${IMG}" sh -lc 'command -v openssl >/dev/null 2>&1; command -v python3 >/dev/null 2>&1'
 
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create "$NET" >/dev/null
@@ -53,20 +50,37 @@ wait_server_ready() {
   return 1
 }
 
-for g in "${GROUPS[@]}"; do
-  if ! group_available "$g"; then
-    echo "=== skip group (not available): ${g} ==="
-    echo
-    continue
-  fi
-
-  echo "=== TLS latency: group=${g} attempts=${N} ==="
-
-  # providers：classic -> default；hybrid/PQ -> oqsprovider+default
-  PROVIDERS="-provider default"
+pick_providers() {
+  local g="$1"
   case "$g" in
-    *MLKEM*|*KYBER*|mlkem*|kyber*) PROVIDERS="-provider oqsprovider -provider default" ;;
+    *MLKEM*|*KYBER*|mlkem*|kyber*) echo "-provider oqsprovider -provider default" ;;
+    *) echo "-provider default" ;;
   esac
+}
+
+# 选择存在的前两组（冒烟）
+SELECTED=()
+for g in "${CANDIDATE_GROUPS[@]}"; do
+  if group_available "$g"; then
+    SELECTED+=("$g")
+  fi
+done
+
+if [ "${#SELECTED[@]}" -eq 0 ]; then
+  echo "ERROR: no TLS groups available from candidates: ${CANDIDATE_GROUPS[*]}"
+  exit 1
+fi
+if [ "${#SELECTED[@]}" -gt 2 ]; then
+  SELECTED=("${SELECTED[@]:0:2}")
+fi
+
+echo "Selected groups: ${SELECTED[*]}"
+echo
+
+for g in "${SELECTED[@]}"; do
+  echo "=== TLS latency: group=${g} ==="
+  PROVIDERS="$(pick_providers "$g")"
+  echo "Providers: ${PROVIDERS}"
 
   docker rm -f server >/dev/null 2>&1 || true
   docker run -d --rm --name server --network "$NET" "${IMG}" sh -lc "
@@ -86,20 +100,21 @@ for g in "${GROUPS[@]}"; do
     exit 1
   fi
 
-  # 在容器内做 N 次测量并直接算分位数/均值（减少宿主 /tmp 依赖）
-  docker run --rm --network "$NET" "${IMG}" sh -lc "
-    set -e
-    python3 - << 'PY'
+  docker run --rm --network "$NET" \
+    -e N="${N}" -e ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" -e PROVIDERS="${PROVIDERS}" \
+    "${IMG}" sh -lc "
+      python3 - << 'PY'
 import subprocess, time, math, statistics, os
 N = int(os.environ.get('N','10'))
 TO = float(os.environ.get('ATTEMPT_TIMEOUT','2'))
 providers = os.environ.get('PROVIDERS','-provider default').split()
+
 cmd = ['openssl','s_client','-connect','server:${PORT}','-tls1_3','-brief'] + providers
 
 lats=[]
 ok=0
 fail=0
-for i in range(N):
+for _ in range(N):
     t0=time.time_ns()
     try:
         subprocess.run(cmd, stdin=subprocess.DEVNULL,
@@ -126,7 +141,7 @@ mean = statistics.mean(lats) if lats else float('nan')
 print(f'attempts={N} ok={ok} failures={fail} success_rate={sr:.1f}% '
       f'ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={mean:.2f}')
 PY
-  " -e N="${N}" -e ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" -e PROVIDERS="${PROVIDERS}"
+    "
 
   echo
 done
