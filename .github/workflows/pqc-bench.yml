@@ -6,38 +6,71 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        continue-on-error: true
 
-      - name: Pull OQS OpenSSL image
-        run: docker pull openquantumsafe/oqs-ossl3:0.12.0
-
-      - name: List repo files (debug)
+      - name: Prepare output files
         run: |
-          echo "=== repo root ==="
-          ls -la
-          echo "=== scripts ==="
-          ls -la scripts || true
+          # 无论后续发生什么，先把文件创建出来，确保 artifacts 一定有东西可上传
+          : > env_info.txt
+          : > tls_bench.txt
+          : > tls_latency.txt
+          : > sig_bench.txt
+          echo "Prepared placeholder files." | tee -a env_info.txt
+        continue-on-error: true
+
+      - name: Debug repo layout
+        run: |
+          echo "=== PWD ===" | tee -a env_info.txt
+          pwd | tee -a env_info.txt
+          echo "=== repo root ===" | tee -a env_info.txt
+          ls -la | tee -a env_info.txt
+          echo "=== scripts dir ===" | tee -a env_info.txt
+          ls -la scripts | tee -a env_info.txt || true
+        continue-on-error: true
+
+      - name: Pull OQS image
+        run: |
+          IMG="openquantumsafe/oqs-ossl3:0.12.0"
+          echo "Pulling $IMG" | tee -a env_info.txt
+          docker pull "$IMG" 2>&1 | tee -a env_info.txt
+        continue-on-error: true
+
+      - name: Sanity check in container
+        run: |
+          IMG="openquantumsafe/oqs-ossl3:0.12.0"
+          echo "=== Sanity check: openssl/python ===" | tee -a env_info.txt
+          docker run --rm "$IMG" sh -lc 'uname -a; command -v openssl; openssl version -a' 2>&1 | tee -a env_info.txt
+          docker run --rm "$IMG" sh -lc 'command -v python3 || true' 2>&1 | tee -a env_info.txt
+        continue-on-error: true
 
       - name: Make scripts executable
-        run: chmod +x scripts/*.sh || true
+        run: |
+          chmod +x scripts/*.sh 2>&1 | tee -a env_info.txt || true
+        continue-on-error: true
 
       - name: Environment info
         run: |
-          bash scripts/env_info.sh 2>&1 | tee env_info.txt || true
+          bash scripts/env_info.sh 2>&1 | tee -a env_info.txt || true
+        continue-on-error: true
 
       - name: TLS handshake throughput
         run: |
-          bash scripts/bench_tls.sh 2>&1 | tee tls_bench.txt || true
+          bash scripts/bench_tls.sh 2>&1 | tee -a tls_bench.txt || true
+        continue-on-error: true
 
       - name: TLS handshake latency
         run: |
-          bash scripts/bench_tls_latency.sh 2>&1 | tee tls_latency.txt || true
+          bash scripts/bench_tls_latency.sh 2>&1 | tee -a tls_latency.txt || true
+        continue-on-error: true
 
       - name: Signature benchmark
         run: |
-          bash scripts/bench_sig.sh 2>&1 | tee sig_bench.txt || true
+          bash scripts/bench_sig.sh 2>&1 | tee -a sig_bench.txt || true
+        continue-on-error: true
 
       - name: Upload results
         if: always()
