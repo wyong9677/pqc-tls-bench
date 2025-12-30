@@ -46,6 +46,7 @@ wait_server_ready() {
   while [ $i -le $tries ]; do
     if docker run --rm --network "$NET" "${IMG}" sh -lc "
       ${container_find_openssl}
+      # BusyBox timeout 可用；失败不输出
       timeout 2s \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief </dev/null >/dev/null 2>&1
     "; then
       return 0
@@ -57,7 +58,6 @@ wait_server_ready() {
 }
 
 echo "=== TLS throughput: TLS1.3 default negotiation (no -groups) ==="
-# 注意：这里不加载 oqsprovider，因为我们也无法指定 group；保持可跑通最重要
 PROVIDERS="-provider default"
 echo "Providers: ${PROVIDERS}"
 
@@ -80,7 +80,8 @@ if ! wait_server_ready; then
   exit 1
 fi
 
-timeout "$((TIMESEC + 15))"s docker run --rm --network "$NET" "${IMG}" sh -lc "
+# 关键修复：不要用外层 timeout。让 s_time 自己按 -time 控制时长。
+docker run --rm --network "$NET" "${IMG}" sh -lc "
   set -e
   ${container_find_openssl}
   \"\$OPENSSL\" s_time -connect server:${PORT} -tls1_3 -new -time ${TIMESEC} ${PROVIDERS}
