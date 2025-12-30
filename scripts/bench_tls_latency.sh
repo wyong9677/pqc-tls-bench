@@ -18,104 +18,93 @@ echo "Image: ${IMG}"
 echo "N: ${N}  attempt_timeout: ${ATTEMPT_TIMEOUT}s"
 echo
 
+# host python3 必须可用（方案B核心）
+python3 --version >/dev/null 2>&1 || { echo "ERROR: host python3 not available"; exit 1; }
+
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create "$NET" >/dev/null
 
-container_find_openssl='
-find_openssl() {
-  for p in /opt/openssl/bin/openssl /opt/openssl32/bin/openssl /usr/local/bin/openssl /usr/bin/openssl /usr/local/ssl/bin/openssl; do
-    [ -x "$p" ] && { echo "$p"; return 0; }
-  done
-  command -v openssl >/dev/null 2>&1 && { command -v openssl; return 0; }
-  return 1
-}
-OPENSSL="$(find_openssl || true)"
-[ -n "$OPENSSL" ] || { echo "ERROR: openssl not found in container" 1>&2; exit 127; }
-'
-
-wait_server_ready() {
-  local tries=25 i=1
-  while [ $i -le $tries ]; do
-    if docker run --rm --network "$NET" "${IMG}" sh -lc "
-      ${container_find_openssl}
-      timeout 2s \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief </dev/null >/dev/null 2>&1
-    "; then
-      return 0
-    fi
-    sleep 0.2
-    i=$((i+1))
-  done
-  return 1
-}
-
-echo "=== TLS latency: TLS1.3 default negotiation (no -groups) ==="
-PROVIDERS="-provider default"
-echo "Providers: ${PROVIDERS}"
-
+# 启动 server
 docker run -d --rm --name server --network "$NET" "${IMG}" sh -lc "
   set -e
-  ${container_find_openssl}
+  OPENSSL=/opt/openssl/bin/openssl
+  [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
+  [ -n \"\$OPENSSL\" ] || exit 127
+
   \"\$OPENSSL\" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -keyout /tmp/key.pem -out /tmp/cert.pem -subj \"/CN=localhost\" -days 1 >/dev/null 2>&1
 
   \"\$OPENSSL\" s_server -accept ${PORT} -tls1_3 \
     -cert /tmp/cert.pem -key /tmp/key.pem \
-    ${PROVIDERS} \
+    -provider default \
     -quiet
 " >/dev/null
 
-if ! wait_server_ready; then
+# 等待 ready
+tries=25
+i=1
+while [ $i -le $tries ]; do
+  if docker run --rm --network "$NET" "${IMG}" sh -lc "
+    OPENSSL=/opt/openssl/bin/openssl
+    [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
+    [ -n \"\$OPENSSL\" ] || exit 127
+    timeout 2s \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief </dev/null >/dev/null 2>&1
+  "; then
+    break
+  fi
+  sleep 0.2
+  i=$((i+1))
+done
+if [ $i -gt $tries ]; then
   echo "ERROR: server not ready"
   docker logs server 2>&1 | tail -n 200 || true
   exit 1
 fi
 
-docker run --rm --network "$NET" \
-  -e N="${N}" -e ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-  "${IMG}" sh -lc "
+# 容器内采样：输出每次成功握手耗时(ms)
+ms_list="$(
+  docker run --rm --network "$NET" -e N="$N" -e TO="$ATTEMPT_TIMEOUT" "${IMG}" sh -lc '
     set -e
-    ${container_find_openssl}
+    OPENSSL=/opt/openssl/bin/openssl
+    [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
+    [ -n "$OPENSSL" ] || exit 127
 
-    n=\${N}
-    to=\${ATTEMPT_TIMEOUT}
-    ok=0
-    fail=0
-    tmp=\$(mktemp)
-    : > \"\$tmp\"
+    n="${N}"
+    to="${TO}"
 
     i=1
-    while [ \$i -le \"\$n\" ]; do
-      t0=\$(date +%s%N)
-      if timeout \"\${to}s\" \"\$OPENSSL\" s_client -connect server:${PORT} -tls1_3 -brief \
-          ${PROVIDERS} </dev/null >/dev/null 2>&1; then
-        t1=\$(date +%s%N)
-        echo \$(( (t1 - t0)/1000000 )) >> \"\$tmp\"
-        ok=\$((ok+1))
-      else
-        fail=\$((fail+1))
+    while [ "$i" -le "$n" ]; do
+      t0=$(date +%s%N)
+      if timeout "${to}s" "$OPENSSL" s_client -connect server:4433 -tls1_3 -brief -provider default </dev/null >/dev/null 2>&1; then
+        t1=$(date +%s%N)
+        echo $(( (t1 - t0)/1000000 ))
       fi
-      i=\$((i+1))
+      i=$((i+1))
     done
+  ' || true
+)"
 
-    cnt=\$(wc -l < \"\$tmp\" | tr -d \" \")
-    if [ \"\$cnt\" -eq 0 ]; then
-      echo \"attempts=\$n ok=0 failures=\$fail success_rate=0.0% (no successful handshakes)\"
-      rm -f \"\$tmp\"
-      exit 0
-    fi
+if [ -z "${ms_list}" ]; then
+  echo "attempts=${N} ok=0 (no successful handshakes)"
+  exit 0
+fi
 
-    sort -n \"\$tmp\" -o \"\$tmp\"
+# host python3 统计分位数
+python3 - <<'PY' <<<"${ms_list}"
+import sys, math, statistics
 
-    pidx() { awk -v c=\"\$1\" -v p=\"\$2\" 'BEGIN{print int((c*p+99)/100)}'; }
+vals = [float(x) for x in sys.stdin.read().split()]
+vals.sort()
 
-    p50=\$(sed -n \"\$(pidx \$cnt 50)p\" \"\$tmp\")
-    p95=\$(sed -n \"\$(pidx \$cnt 95)p\" \"\$tmp\")
-    p99=\$(sed -n \"\$(pidx \$cnt 99)p\" \"\$tmp\")
-    mean=\$(awk '{s+=\$1} END{printf \"%.2f\", s/NR}' \"\$tmp\")
-    sr=\$(awk -v ok=\"\$ok\" -v n=\"\$n\" 'BEGIN{printf \"%.1f\", (ok*100.0/n)}')
+def pct(p):
+    k=(len(vals)-1)*p/100.0
+    f=math.floor(k); c=math.ceil(k)
+    if f==c:
+        return vals[int(k)]
+    return vals[f]*(c-k)+vals[c]*(k-f)
 
-    echo \"attempts=\$n ok=\$ok failures=\$fail success_rate=\${sr}% ms: p50=\${p50} p95=\${p95} p99=\${p99} mean=\${mean}\"
-    rm -f \"\$tmp\"
-  "
+mean = statistics.mean(vals)
+print(f"count={len(vals)} ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={mean:.2f}")
+PY
 
 echo
