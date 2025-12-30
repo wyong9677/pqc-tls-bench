@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMG="${IMG:?IMG is required}"
+# ======================
+# Config
+# ======================
+IMG="${IMG:?IMG is required (e.g., openquantumsafe/oqs-ossl3:latest)}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
-MODE="${MODE:-paper}"
+MODE="${MODE:-paper}"              # paper | smoke
 
 REPEATS="${REPEATS:-7}"
 WARMUP="${WARMUP:-2}"
-BENCH_SECONDS="${BENCH_SECONDS:-20}"
+BENCH_SECONDS="${BENCH_SECONDS:-15}"
 
+# smoke: fast sanity check
 if [ "${MODE}" = "smoke" ]; then
   REPEATS=1
   WARMUP=1
-  BENCH_SECONDS=5
+  BENCH_SECONDS=3
 fi
 
 SIGS=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
 
 csv="${RESULTS_DIR}/sig_speed.csv"
 rawdir="${RESULTS_DIR}/sig_speed_raw"
-metadir="${RESULTS_DIR}/meta"
-mkdir -p "${rawdir}" "${metadir}"
+mkdir -p "${rawdir}"
 
 echo "repeat,mode,seconds,alg,keygens_s,sign_s,verify_s" > "${csv}"
 
@@ -29,125 +32,127 @@ echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS}"
 echo "IMG=${IMG}"
 echo
 
-# ---------------- helpers ----------------
+die() {
+  echo "ERROR: $*" 1>&2
+  exit 1
+}
+
+# Numeric validator: accepts 123 or 123.45 (no commas, no NaN, no empty)
+is_num() {
+  [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+# Find openssl inside container, force stable locale
 FIND_OPENSSL='
-set -e
 export LC_ALL=C
 OPENSSL=/opt/openssl/bin/openssl
 [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
-[ -n "$OPENSSL" ] || { echo "ERROR: openssl not found" 1>&2; exit 127; }
+[ -n "$OPENSSL" ] || { echo "openssl_not_found" 1>&2; exit 127; }
 echo "$OPENSSL"
 '
 
-is_num() {
-  awk 'BEGIN{ok=0} { if($0 ~ /^[0-9]+([.][0-9]+)?$/) ok=1 } END{exit(ok?0:1)}' <<<"${1:-}"
-}
+# ----------------------
+# Parsers
+# ----------------------
 
-die() { echo "ERROR: $*" 1>&2; exit 1; }
-
-# PQC: 优先“算法行表格”，否则 fallback “块格式”
-parse_pqc() {
-  local alg="$1"
-  local text="$2"
-
-  if ! awk -v a="$alg" '
-      BEGIN{IGNORECASE=1; found=0}
-      $1==a && $2 ~ /^[0-9]+([.][0-9]+)?$/ && $3 ~ /^[0-9]+([.][0-9]+)?$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/ {
-        print $2 "," $3 "," $4;
-        found=1; exit
-      }
-      END{ if(!found) exit 1 }
-    ' <<<"$text"
-  then
-    awk '
-      /keygens\/s/ { if($2 ~ /^[0-9]+([.][0-9]+)?$/) kg=$2 }
-      /signs\/s/  { if($2 ~ /^[0-9]+([.][0-9]+)?$/) sg=$2 }
-      /verifs\/s/ { if($2 ~ /^[0-9]+([.][0-9]+)?$/) vf=$2 }
-      END{
-        if(kg=="") kg="";
-        if(sg=="") sg="";
-        if(vf=="") vf="";
-        print kg "," sg "," vf
-      }
-    ' <<<"$text"
-  fi
-}
-
-# ECDSA:
-# - 若出现 signs/s verifs/s 则按块格式
-# - 否则按 OpenSSL ecdsa 表格行： "256 bits ecdsa (nistp256) ... <sign/s> <verify/s>"
-parse_ecdsa() {
-  local text="$1"
-
-  if grep -q "signs/s" <<<"$text"; then
-    awk '
-      /signs\/s/  { if($2 ~ /^[0-9]+([.][0-9]+)?$/) sg=$2 }
-      /verifs\/s/ { if($2 ~ /^[0-9]+([.][0-9]+)?$/) vf=$2 }
-      END{
-        if(sg=="") sg="";
-        if(vf=="") vf="";
-        print sg "," vf
-      }
-    ' <<<"$text"
-    return 0
-  fi
-
-  # 兼容你贴出的真实格式：取 “256 bits ecdsa (nistp256)” 这一行最后两列
+# Parse PQC "block format":
+# lines might include:
+#   keygens/s  28783.8
+#   signs/s    12258.4
+#   verifs/s   31404.6
+#
+# Important: ignore header like "keygens/s signs/s verifs/s"
+parse_block_pqc() {
   awk '
-    BEGIN{sg=""; vf=""; found=0}
-    $1=="256" && $2=="bits" && $3=="ecdsa" {
-      # last two fields should be sign/s verify/s
-      s=$(NF-1); v=$NF
-      if (s ~ /^[0-9]+([.][0-9]+)?$/ && v ~ /^[0-9]+([.][0-9]+)?$/) {
-        sg=s; vf=v; found=1; exit
-      }
-    }
-    END{
-      if(!found){ print ","; exit 0 }
-      print sg "," vf
-    }
-  ' <<<"$text"
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?$/) }
+    /keygens\/s/ { if (isnum($2)) kg=$2 }
+    /signs\/s/   { if (isnum($2)) sg=$2 }
+    /verifs\/s/  { if (isnum($2)) vf=$2 }
+    END { print kg "," sg "," vf }
+  '
 }
 
-# ---------------- runners ----------------
+# Parse PQC "table row" format:
+# e.g.  mldsa44  28783.8  12258.4  31404.6
+parse_table_row_alg() {
+  local alg="$1"
+  awk -v A="${alg}" '
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?$/) }
+    $1==A && NF>=4 && isnum($2) && isnum($3) && isnum($4) { print $2 "," $3 "," $4; found=1; exit 0 }
+    END { if(!found) print ",," }
+  '
+}
+
+# Parse ECDSA from "ecdsap256 block" if it exists (rare)
+parse_block_ecdsa() {
+  awk '
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?$/) }
+    /signs\/s/  { if (isnum($2)) sg=$2 }
+    /verifs\/s/ { if (isnum($2)) vf=$2 }
+    END { print sg "," vf }
+  '
+}
+
+# Parse ECDSA from standard table output:
+# Example you posted:
+#                               sign    verify    sign/s verify/s
+#  256 bits ecdsa (nistp256)   0.0000s   0.0001s  43514.7  14540.3
+#
+# We find a line that contains "256 bits" AND "ecdsa" (case-insensitive),
+# then take last two fields as sign/s and verify/s.
+parse_ecdsa_256_table() {
+  awk '
+    function tolower_str(s,    i,c,out){ out=""; for(i=1;i<=length(s);i++){c=substr(s,i,1); out=out tolower(c)}; return out }
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?$/) }
+
+    {
+      line=$0
+      low=tolower_str(line)
+      if (low ~ /256 bits/ && low ~ /ecdsa/) {
+        # sign/s and verify/s are typically the last two columns
+        s=$(NF-1); v=$NF
+        if (isnum(s) && isnum(v)) {
+          print s "," v
+          found=1
+          exit 0
+        }
+      }
+    }
+    END { if(!found) print "," }
+  '
+}
+
+# ----------------------
+# Runners
+# ----------------------
+
 run_speed_pqc() {
   local alg="$1"
   docker run --rm "${IMG}" sh -lc "
     set -e
-    export LC_ALL=C
     OPENSSL=\$(${FIND_OPENSSL})
-    \"\$OPENSSL\" speed -seconds ${BENCH_SECONDS} -provider oqsprovider -provider default ${alg}
-  " 2>/dev/null || true
+    # oqsprovider + default for PQC
+    \"\$OPENSSL\" speed -seconds ${BENCH_SECONDS} -provider oqsprovider -provider default ${alg} 2>/dev/null || true
+  "
 }
 
 run_speed_ecdsa() {
   docker run --rm "${IMG}" sh -lc "
     set -e
-    export LC_ALL=C
     OPENSSL=\$(${FIND_OPENSSL})
-
+    # Try ecdsap256 first (some builds support it)
     if \"\$OPENSSL\" speed -seconds ${BENCH_SECONDS} -provider default ecdsap256 >/tmp/out 2>/dev/null; then
       cat /tmp/out
       exit 0
     fi
-
+    # Fallback to 'ecdsa' table (common)
     \"\$OPENSSL\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>/dev/null || true
   "
 }
 
-# ---------------- meta capture ----------------
-docker run --rm "${IMG}" sh -lc "
-  set -e
-  export LC_ALL=C
-  OPENSSL=\$(${FIND_OPENSSL})
-  echo \"OPENSSL_PATH=\$OPENSSL\"
-  \"\$OPENSSL\" version -a || true
-  echo
-  echo \"== providers ==\"
-  \"\$OPENSSL\" list -providers 2>/dev/null || true
-" > "${metadir}/openssl_env.txt" 2>&1 || true
-
-# ---------------- warmup ----------------
+# ----------------------
+# Warmup
+# ----------------------
 for _ in $(seq 1 "${WARMUP}"); do
   run_speed_ecdsa >/dev/null 2>&1 || true
   for alg in "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
@@ -155,59 +160,75 @@ for _ in $(seq 1 "${WARMUP}"); do
   done
 done
 
-# ---------------- benchmark ----------------
+# ----------------------
+# Measure
+# ----------------------
 for r in $(seq 1 "${REPEATS}"); do
   for alg in "${SIGS[@]}"; do
+    out=""
     if [ "${alg}" = "ecdsap256" ]; then
       out="$(run_speed_ecdsa || true)"
     else
       out="$(run_speed_pqc "${alg}" || true)"
     fi
 
-    printf "%s\n" "$out" > "${rawdir}/rep${r}_${alg}.txt"
+    raw="${rawdir}/rep${r}_${alg}.txt"
+    printf "%s\n" "$out" > "${raw}"
 
     keygens="" ; sign="" ; verify=""
 
     if [ "${alg}" = "ecdsap256" ]; then
-      IFS=',' read -r sign verify < <(parse_ecdsa "$out")
-      keygens=""
-    else
-      IFS=',' read -r keygens sign verify < <(parse_pqc "${alg}" "$out")
-    fi
-
-    # paper 模式：严格数值校验
-    if [ "${MODE}" = "paper" ]; then
-      if [ "${alg}" = "ecdsap256" ]; then
-        is_num "${sign:-}"   || die "ECDSA sign missing/non-numeric (rep=${r}). See ${rawdir}/rep${r}_${alg}.txt"
-        is_num "${verify:-}" || die "ECDSA verify missing/non-numeric (rep=${r}). See ${rawdir}/rep${r}_${alg}.txt"
+      # A) block format (if exists)
+      if printf "%s\n" "$out" | grep -q "signs/s"; then
+        IFS=',' read -r sign verify < <(printf "%s\n" "$out" | parse_block_ecdsa)
       else
-        is_num "${keygens:-}" || die "${alg} keygens missing/non-numeric (rep=${r}). See ${rawdir}/rep${r}_${alg}.txt"
-        is_num "${sign:-}"    || die "${alg} sign missing/non-numeric (rep=${r}). See ${rawdir}/rep${r}_${alg}.txt"
-        is_num "${verify:-}"  || die "${alg} verify missing/non-numeric (rep=${r}). See ${rawdir}/rep${r}_${alg}.txt"
+        # B) standard ecdsa table
+        IFS=',' read -r sign verify < <(printf "%s\n" "$out" | parse_ecdsa_256_table)
       fi
+
+      # Validate ECDSA sign/verify
+      if ! is_num "${sign:-}" || ! is_num "${verify:-}"; then
+        if [ "${MODE}" = "paper" ]; then
+          die "ECDSA sign/verify missing/non-numeric (rep=${r}). See ${raw}"
+        fi
+        echo "rep=${r} alg=${alg} (missing) sign=${sign:-} verify=${verify:-}"
+        echo "${r},${MODE},${BENCH_SECONDS},${alg},,,">> "${csv}"
+        continue
+      fi
+
+      echo "rep=${r} alg=${alg} sign/s=${sign} verify/s=${verify}"
+      echo "${r},${MODE},${BENCH_SECONDS},${alg},,${sign},${verify}" >> "${csv}"
+      continue
     fi
 
-    echo "rep=${r} alg=${alg} keygens/s=${keygens:-} sign/s=${sign:-} verify/s=${verify:-}"
+    # PQC: prefer table-row parse first (most stable), then fallback to block parse
+    IFS=',' read -r keygens sign verify < <(printf "%s\n" "$out" | parse_table_row_alg "${alg}")
+    if ! is_num "${keygens:-}" || ! is_num "${sign:-}" || ! is_num "${verify:-}"; then
+      IFS=',' read -r keygens sign verify < <(printf "%s\n" "$out" | parse_block_pqc)
+    fi
+
+    # Validate PQC
+    if ! is_num "${keygens:-}" || ! is_num "${sign:-}" || ! is_num "${verify:-}"; then
+      if [ "${MODE}" = "paper" ]; then
+        die "PQC metrics missing/non-numeric for alg=${alg} (rep=${r}). See ${raw}"
+      fi
+      echo "rep=${r} alg=${alg} (missing) keygens=${keygens:-} sign=${sign:-} verify=${verify:-}"
+      echo "${r},${MODE},${BENCH_SECONDS},${alg},,," >> "${csv}"
+      continue
+    fi
+
+    echo "rep=${r} alg=${alg} keygens/s=${keygens} sign/s=${sign} verify/s=${verify}"
     echo "${r},${MODE},${BENCH_SECONDS},${alg},${keygens},${sign},${verify}" >> "${csv}"
   done
 done
 
-# 末尾复核：paper 模式不允许空字段
-if [ "${MODE}" = "paper" ]; then
-  awk -F, '
-    NR==1{next}
-    {
-      alg=$4; kg=$5; sg=$6; vf=$7
-      if (alg=="ecdsap256") {
-        if (sg=="" || vf=="") { print "BAD ECDSA row at line " NR > "/dev/stderr"; exit 2 }
-      } else {
-        if (kg=="" || sg=="" || vf=="") { print "BAD PQC row at line " NR " alg=" alg > "/dev/stderr"; exit 2 }
-      }
-    }
-  ' "${csv}"
+# Final audit: CSV must not contain 'signs'/'verifs' in numeric fields
+if awk -F',' 'NR>1 && ($5 ~ /signs|verifs/ || $6 ~ /signs|verifs/ || $7 ~ /signs|verifs/) {exit 1}' "${csv}"; then
+  :
+else
+  die "CSV audit failed: header tokens leaked into numeric columns. Check raw outputs under ${rawdir}"
 fi
 
 echo
 echo "CSV: ${csv}"
 echo "Raw: ${rawdir}/rep*_*.txt"
-echo "Meta: ${metadir}/openssl_env.txt"
