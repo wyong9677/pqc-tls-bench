@@ -1,0 +1,87 @@
+name: pqc-bench-paper
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke=quick; paper=publication-grade"
+        required: true
+        default: "paper"
+        type: choice
+        options: ["smoke", "paper"]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      IMG: openquantumsafe/oqs-ossl3:latest
+      RESULTS_DIR: results
+
+      # 默认给 paper；smoke 会在脚本里自动覆盖为更小值
+      REPEATS: "5"
+      WARMUP: "2"
+      TIMESEC: "15"          # s_time duration
+      N: "200"               # latency samples per repeat
+      ATTEMPT_TIMEOUT: "3"   # seconds per handshake attempt
+      BENCH_SECONDS: "15"    # openssl speed seconds
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare dirs
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULTS_DIR}"
+
+      - name: Pull image
+        run: |
+          set -euo pipefail
+          docker pull "${IMG}"
+          echo "=== RepoDigests ===" | tee "${RESULTS_DIR}/image_digest.txt"
+          docker inspect --format='{{join .RepoDigests "\n"}}' "${IMG}" | tee -a "${RESULTS_DIR}/image_digest.txt"
+
+      - name: Make scripts executable
+        run: |
+          set -euo pipefail
+          chmod +x scripts/*.sh
+
+      - name: Env info
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+            bash scripts/env_info.sh |& tee "${RESULTS_DIR}/env_info.txt"
+
+      - name: TLS throughput (repeated)
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
+            bash scripts/bench_tls.sh |& tee "${RESULTS_DIR}/tls_throughput.txt"
+
+      - name: TLS latency (paper-grade, raw + adjusted, repeated)
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
+            bash scripts/bench_tls_latency.sh |& tee "${RESULTS_DIR}/tls_latency.txt"
+
+      - name: Signature benchmark (repeated)
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" \
+            bash scripts/bench_sig.sh |& tee "${RESULTS_DIR}/sig_bench.txt"
+
+      - name: Summarize to paper tables
+        run: |
+          set -euo pipefail
+          python3 scripts/summarize_results.py "${RESULTS_DIR}" | tee "${RESULTS_DIR}/paper_tables.md"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqc-paper-results
+          path: results
