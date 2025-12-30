@@ -2,46 +2,49 @@
 set -euo pipefail
 
 IMG="${IMG:-openquantumsafe/oqs-ossl3:latest}"
-OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
-
 NET="pqcnet"
 PORT=4433
-N="${N:-50}"
+N="${N:-10}"          # 冒烟默认 10
+ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-2}"  # 单次握手 timeout（秒）
 
-GROUPS=("X25519")
+# classic + (可用则跑) hybrid
+GROUPS=("X25519" "X25519MLKEM768")
 
-echo "=== bench_tls_latency.sh ==="
+cleanup() {
+  docker rm -f server >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "=== bench_tls_latency.sh (smoke) ==="
 echo "Image: ${IMG}"
-echo "OPENSSL_BIN: ${OPENSSL_BIN}"
 echo "Attempts (N): ${N}"
+echo "Attempt timeout: ${ATTEMPT_TIMEOUT}s"
 echo
 
-docker run --rm -e OPENSSL_BIN="${OPENSSL_BIN}" "${IMG}" sh -lc '
-  if [ -x "$OPENSSL_BIN" ] || command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
-    "$OPENSSL_BIN" version -a >/dev/null 2>&1 || true
-    exit 0
-  fi
-  echo "ERROR: cannot execute OPENSSL_BIN inside container: $OPENSSL_BIN"
-  exit 1
-' >/dev/null
+# Sanity: openssl in container
+docker run --rm "${IMG}" sh -lc 'command -v openssl >/dev/null 2>&1; openssl version -a >/dev/null 2>&1 || true'
 
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create "$NET" >/dev/null
 
 gen_cert='
 set -e
-"$OPENSSL_BIN" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout /tmp/key.pem -out /tmp/cert.pem -subj "/CN=localhost" -days 1 >/dev/null 2>&1
 '
 
+group_available() {
+  local g="$1"
+  docker run --rm "${IMG}" sh -lc "openssl list -groups 2>/dev/null | grep -qx '${g}'"
+}
+
 wait_server_ready() {
-  local tries=30
+  local tries=20
   local i=1
   while [ $i -le $tries ]; do
-    if docker run --rm --network "$NET" \
-      -e OPENSSL_BIN="${OPENSSL_BIN}" \
-      "$IMG" sh -lc \
-      "timeout 3s sh -lc 'echo | \"\$OPENSSL_BIN\" s_client -connect server:${PORT} -tls1_3 -brief >/dev/null 2>&1'"; then
+    if docker run --rm --network "$NET" "${IMG}" sh -lc \
+      "timeout 2s openssl s_client -connect server:${PORT} -tls1_3 -brief </dev/null >/dev/null 2>&1"; then
       return 0
     fi
     sleep 0.2
@@ -51,20 +54,30 @@ wait_server_ready() {
 }
 
 for g in "${GROUPS[@]}"; do
+  if ! group_available "$g"; then
+    echo "=== skip group (not available): ${g} ==="
+    echo
+    continue
+  fi
+
   echo "=== TLS latency: group=${g} attempts=${N} ==="
 
+  # providers：classic -> default；hybrid/PQ -> oqsprovider+default
+  PROVIDERS="-provider default"
+  case "$g" in
+    *MLKEM*|*KYBER*|mlkem*|kyber*) PROVIDERS="-provider oqsprovider -provider default" ;;
+  esac
+
   docker rm -f server >/dev/null 2>&1 || true
-  docker run -d --rm --name server --network "$NET" \
-    -e OPENSSL_BIN="${OPENSSL_BIN}" \
-    "$IMG" sh -lc "
-      set -e
-      ${gen_cert}
-      \"\$OPENSSL_BIN\" s_server -accept ${PORT} -tls1_3 \
-        -cert /tmp/cert.pem -key /tmp/key.pem \
-        -groups ${g} \
-        -provider oqsprovider -provider default \
-        -quiet
-    " >/dev/null
+  docker run -d --rm --name server --network "$NET" "${IMG}" sh -lc "
+    set -e
+    ${gen_cert}
+    openssl s_server -accept ${PORT} -tls1_3 \
+      -cert /tmp/cert.pem -key /tmp/key.pem \
+      -groups ${g} \
+      ${PROVIDERS} \
+      -quiet
+  " >/dev/null
 
   if ! wait_server_ready; then
     echo "ERROR: server not ready for group=${g}"
@@ -73,55 +86,47 @@ for g in "${GROUPS[@]}"; do
     exit 1
   fi
 
-  # 固定尝试 N 次：成功则输出耗时(ms)；失败只计数
-  docker run --rm --network "$NET" \
-    -e OPENSSL_BIN="${OPENSSL_BIN}" \
-    "$IMG" sh -lc "
-      ok=0
-      fail=0
-      i=1
-      while [ \$i -le ${N} ]; do
-        t0=\$(date +%s%N)
-        if timeout 3s sh -lc 'echo | \"\$OPENSSL_BIN\" s_client -connect server:${PORT} -tls1_3 \
-              -provider oqsprovider -provider default -brief >/dev/null 2>&1'; then
-          t1=\$(date +%s%N)
-          echo \$(( (t1 - t0)/1000000 ))
-          ok=\$((ok+1))
-        else
-          fail=\$((fail+1))
-        fi
-        i=\$((i+1))
-      done
-      echo \"OK=\$ok FAIL=\$fail\" 1>&2
-    " 2> /tmp/okfail.log | sort -n > /tmp/lats_ms.txt
+  # 在容器内做 N 次测量并直接算分位数/均值（减少宿主 /tmp 依赖）
+  docker run --rm --network "$NET" "${IMG}" sh -lc "
+    set -e
+    python3 - << 'PY'
+import subprocess, time, math, statistics, os
+N = int(os.environ.get('N','10'))
+TO = float(os.environ.get('ATTEMPT_TIMEOUT','2'))
+providers = os.environ.get('PROVIDERS','-provider default').split()
+cmd = ['openssl','s_client','-connect','server:${PORT}','-tls1_3','-brief'] + providers
 
-  ok=$(grep -Eo 'OK=[0-9]+' /tmp/okfail.log | tail -n1 | cut -d= -f2 || echo "0")
-  failures=$(grep -Eo 'FAIL=[0-9]+' /tmp/okfail.log | tail -n1 | cut -d= -f2 || echo "0")
+lats=[]
+ok=0
+fail=0
+for i in range(N):
+    t0=time.time_ns()
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=TO, check=False)
+        t1=time.time_ns()
+        lats.append((t1-t0)/1e6)
+        ok += 1
+    except subprocess.TimeoutExpired:
+        fail += 1
 
-  count=$(wc -l < /tmp/lats_ms.txt)
+lats.sort()
+def pct(p):
+    if not lats:
+        return float('nan')
+    k=(len(lats)-1)*p/100.0
+    f=math.floor(k); c=math.ceil(k)
+    if f==c:
+        return lats[int(k)]
+    return lats[f]*(c-k)+lats[c]*(k-f)
 
-  if [ "$count" -eq 0 ]; then
-    echo "attempts=${N} ok=0 failures=${failures} (no successful handshakes)"
-    echo
-    continue
-  fi
+sr = (ok*100.0/N) if N>0 else float('nan')
+mean = statistics.mean(lats) if lats else float('nan')
+print(f'attempts={N} ok={ok} failures={fail} success_rate={sr:.1f}% '
+      f'ms: p50={pct(50):.2f} p95={pct(95):.2f} p99={pct(99):.2f} mean={mean:.2f}')
+PY
+  " -e N="${N}" -e ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" -e PROVIDERS="${PROVIDERS}"
 
-  p50_idx=$(( (count*50 + 99)/100 ))
-  p95_idx=$(( (count*95 + 99)/100 ))
-  p99_idx=$(( (count*99 + 99)/100 ))
-
-  p50=$(sed -n "${p50_idx}p" /tmp/lats_ms.txt)
-  p95=$(sed -n "${p95_idx}p" /tmp/lats_ms.txt)
-  p99=$(sed -n "${p99_idx}p" /tmp/lats_ms.txt)
-
-  mean=$(awk '{s+=$1} END{if(NR>0) printf "%.2f", s/NR; else print "nan"}' /tmp/lats_ms.txt)
-
-  # 成功率（百分比）
-  success_rate=$(awk -v ok="$ok" -v n="${N}" 'BEGIN{ if(n>0) printf "%.1f", (ok*100.0/n); else print "nan"; }')
-
-  echo "attempts=${N} ok=${ok} failures=${failures} success_rate=${success_rate}% ms: p50=${p50} p95=${p95} p99=${p99} mean=${mean}"
   echo
 done
-
-docker rm -f server >/dev/null 2>&1 || true
-docker network rm "$NET" >/dev/null 2>&1 || true
