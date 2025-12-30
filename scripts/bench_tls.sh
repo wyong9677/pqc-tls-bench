@@ -20,78 +20,64 @@ echo
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create "$NET" >/dev/null
 
-# ---- container snippet: find openssl ----
+# --- container: find openssl ---
 container_find_openssl='
 find_openssl() {
-  for p in /opt/openssl32/bin/openssl /opt/openssl/bin/openssl /usr/local/bin/openssl /usr/bin/openssl /usr/local/ssl/bin/openssl; do
+  for p in /opt/openssl/bin/openssl /opt/openssl32/bin/openssl /usr/local/bin/openssl /usr/bin/openssl /usr/local/ssl/bin/openssl; do
     [ -x "$p" ] && { echo "$p"; return 0; }
   done
   command -v openssl >/dev/null 2>&1 && { command -v openssl; return 0; }
-  if command -v find >/dev/null 2>&1; then
-    f="$(find /opt /usr/local /usr -maxdepth 6 -type f -name openssl 2>/dev/null | head -n 1 || true)"
-    [ -n "$f" ] && [ -x "$f" ] && { echo "$f"; return 0; }
-  fi
   return 1
 }
 OPENSSL="$(find_openssl || true)"
 [ -n "$OPENSSL" ] || { echo "ERROR: openssl not found in container" 1>&2; exit 127; }
 '
 
-# ---- diagnostic: print openssl path + raw groups ----
-echo "== Diagnostic: openssl path + raw 'list -groups' (head) =="
+echo "== Diagnostic: openssl + s_client -groups help (head) =="
 docker run --rm "${IMG}" sh -lc "
   set -e
   ${container_find_openssl}
   echo \"OPENSSL_BIN=\$OPENSSL\"
+  \"\$OPENSSL\" version -a 2>&1 | head -n 15 || true
   echo
-  echo \"-- openssl version (head) --\"
-  \"\$OPENSSL\" version -a 2>&1 | head -n 20 || true
+  # 关键：TLS 组列表从这里拿
+  \"\$OPENSSL\" s_client -help 2>&1 | grep -n \"-groups\" -n || true
   echo
-  echo \"-- openssl list -groups (head) --\"
-  \"\$OPENSSL\" list -groups 2>&1 | head -n 120 || true
+  \"\$OPENSSL\" s_client -groups help 2>&1 | head -n 120 || true
 " || true
 echo
 
-# ---- get groups tokens (robust; never hard-fail) ----
-get_groups_tokens() {
+# --- 从 s_client -groups help 提取 token ---
+get_tls_groups() {
   docker run --rm "${IMG}" sh -lc "
     ${container_find_openssl}
-    # 输出原始 groups，并尽量提取 token：去缩进、去冒号/逗号/括号，只取第一列
-    \"\$OPENSSL\" list -groups 2>/dev/null \
-      | sed -e 's/^[[:space:]]*//' -e 's/[,:].*$//' -e 's/[()]//g' \
-      | awk 'NF>0{print \$1}' \
+    \"\$OPENSSL\" s_client -groups help 2>/dev/null \
+      | tr ',\\t' '  ' \
+      | tr -s ' ' '\n' \
+      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
       | grep -E '^[A-Za-z0-9._-]+$' \
+      | grep -viE '^(help|Supported|groups|named|default)$' \
       | sort -u
   " 2>/dev/null || true
 }
 
-GROUPS="$(get_groups_tokens || true)"
-if [ -n "$GROUPS" ]; then
-  echo "Parsed group tokens (head):"
-  echo "$GROUPS" | head -n 30
-  echo
-else
-  echo "WARN: could not parse any group tokens; will run with default group negotiation (no -groups)."
-  echo
-fi
+GROUPS="$(get_tls_groups || true)"
 
-pick_classic_group() {
-  # 优先 x25519（大小写不敏感），否则选第一条
-  local g
+pick_classic() {
+  local g=""
   g="$(echo "$GROUPS" | grep -iE '^x25519$' | head -n1 || true)"
+  [ -z "$g" ] && g="$(echo "$GROUPS" | grep -iE 'secp256r1|prime256v1|p-256|p256' | head -n1 || true)"
   [ -z "$g" ] && g="$(echo "$GROUPS" | head -n1 || true)"
   echo "$g"
 }
 
-pick_pq_group() {
-  # 优先带 mlkem/kyber/oqs 的 token
-  local g
-  g="$(echo "$GROUPS" | grep -iE 'mlkem|kyber|oqs' | head -n1 || true)"
-  echo "$g"
+pick_pq_or_hybrid() {
+  # 优先含 mlkem/kyber（hybrid 通常包含 x25519mlkem...）
+  echo "$GROUPS" | grep -iE 'mlkem|kyber' | head -n1 || true
 }
 
 wait_server_ready() {
-  local tries=20 i=1
+  local tries=25 i=1
   while [ $i -le $tries ]; do
     if docker run --rm --network "$NET" "${IMG}" sh -lc "
       ${container_find_openssl}
@@ -107,7 +93,7 @@ wait_server_ready() {
 
 run_one() {
   local label="$1"
-  local group="${2:-}"         # 允许为空 => 不传 -groups
+  local group="${2:-}"         # 可为空：默认协商
   local providers="$3"
 
   echo "=== TLS throughput: ${label} group=${group:-<default>} ==="
@@ -117,7 +103,6 @@ run_one() {
   docker run -d --rm --name server --network "$NET" "${IMG}" sh -lc "
     set -e
     ${container_find_openssl}
-
     \"\$OPENSSL\" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
       -keyout /tmp/key.pem -out /tmp/cert.pem -subj \"/CN=localhost\" -days 1 >/dev/null 2>&1
 
@@ -148,18 +133,25 @@ run_one() {
   echo
 }
 
-# classic：如果解析到了 group，就用；否则默认协商
-CLASSIC="$(pick_classic_group || true)"
-if [ -n "$CLASSIC" ]; then
-  run_one "classic" "$CLASSIC" "-provider default"
-else
+if [ -z "$GROUPS" ]; then
+  echo "WARN: could not parse TLS groups from 's_client -groups help'. Running default negotiation only."
   run_one "classic_default" "" "-provider default"
+  exit 0
 fi
 
-# pq/hybrid：只有解析到看起来像 mlkem/kyber/oqs 的 group 才跑
-PQ="$(pick_pq_group || true)"
+echo "Parsed TLS group tokens (head):"
+echo "$GROUPS" | head -n 40
+echo
+
+CLASSIC="$(pick_classic || true)"
+PQ="$(pick_pq_or_hybrid || true)"
+
+# classic：default provider
+[ -n "$CLASSIC" ] && run_one "classic" "$CLASSIC" "-provider default" || run_one "classic_default" "" "-provider default"
+
+# pq/hybrid：如果能找到含 mlkem/kyber 的 group，则加载 oqsprovider 运行
 if [ -n "$PQ" ]; then
   run_one "pqc_or_hybrid" "$PQ" "-provider oqsprovider -provider default"
 else
-  echo "NOTE: no pq/hybrid-looking group token found; done."
+  echo "NOTE: no mlkem/kyber-looking TLS group found; only classic baseline produced."
 fi
