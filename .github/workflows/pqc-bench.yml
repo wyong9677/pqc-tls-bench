@@ -1,0 +1,43 @@
+name: pqc-bench
+on:
+  workflow_dispatch: {}
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull OQS OpenSSL image
+        run: |
+          docker pull openquantumsafe/oqs-ossl3:latest
+
+      - name: Make scripts executable
+        run: |
+          chmod +x scripts/*.sh
+
+      - name: Environment info
+        run: |
+          bash scripts/env_info.sh | tee env_info.txt
+
+      - name: TLS handshake throughput
+        run: |
+          bash scripts/bench_tls.sh | tee tls_bench.txt
+
+      - name: TLS handshake latency
+        run: |
+          bash scripts/bench_tls_latency.sh | tee tls_latency.txt
+
+      - name: Signature benchmark
+        run: |
+          bash scripts/bench_sig.sh | tee sig_bench.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqc-bench-results
+          path: |
+            env_info.txt
+            tls_bench.txt
+            tls_latency.txt
+            sig_bench.txt
