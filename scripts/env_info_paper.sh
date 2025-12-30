@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMG="${IMG:-openquantumsafe/oqs-ossl3:latest}"
+IMG="${IMG:?IMG is required}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 
 echo "=== Host ==="
@@ -18,6 +18,7 @@ echo
 
 echo "=== Docker ==="
 docker --version || true
+docker info 2>/dev/null | head -n 80 || true
 echo
 
 echo "=== Host Python ==="
