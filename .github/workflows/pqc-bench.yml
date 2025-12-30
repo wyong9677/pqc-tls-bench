@@ -6,122 +6,66 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     env:
-      # 先用 latest 跑通；跑通后改为 digest 固定复现
       IMG: openquantumsafe/oqs-ossl3:latest
 
-      # 基准参数（统一控制）
-      TIMESEC: "15"        # throughput s_time 持续秒数
-      N: "50"              # latency 采样次数
-      BENCH_SECONDS: "5"   # openssl speed seconds（不要用 SECONDS）
+      # 冒烟测试参数：先跑通、先出结果
+      TIMESEC: "5"        # openssl s_time 运行秒数
+      N: "10"             # latency 采样次数
+      BENCH_SECONDS: "2"  # openssl speed 秒数
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare output files
+      - name: Show repo layout
         run: |
-          : > env_info.txt
-          : > tls_bench.txt
-          : > tls_latency.txt
-          : > sig_bench.txt
-          echo "Prepared placeholder files." | tee -a env_info.txt
-
-      - name: Debug repo layout
-        run: |
-          echo "=== PWD ===" | tee -a env_info.txt
-          pwd | tee -a env_info.txt
-          echo "=== repo root ===" | tee -a env_info.txt
-          ls -la | tee -a env_info.txt
-          echo "=== scripts dir ===" | tee -a env_info.txt
-          ls -la scripts | tee -a env_info.txt || true
+          set -e
+          pwd
+          ls -la
+          ls -la scripts || true
 
       - name: Pull OQS image
-        timeout-minutes: 5
+        timeout-minutes: 3
         run: |
-          echo "Pulling ${IMG}" | tee -a env_info.txt
-          docker pull "${IMG}" 2>&1 | tee -a env_info.txt
+          set -e
+          docker pull "${IMG}"
 
-      - name: Probe OPENSSL_BIN in container
+      - name: Container sanity (openssl/providers/groups)
         timeout-minutes: 2
         run: |
-          echo "=== Probe OPENSSL_BIN ===" | tee -a env_info.txt
-          echo "IMG=${IMG}" | tee -a env_info.txt
-
-          OPENSSL_BIN="$(docker run --rm "${IMG}" sh -lc '
-            for p in \
-              /usr/local/bin/openssl \
-              /usr/bin/openssl \
-              /opt/openssl/bin/openssl \
-              /opt/oqs/bin/openssl \
-              /opt/local/bin/openssl \
-              /usr/local/ssl/bin/openssl
-            do
-              if [ -x "$p" ]; then
-                echo "$p"
-                exit 0
-              fi
-            done
-            if command -v openssl >/dev/null 2>&1; then
-              echo openssl
-              exit 0
-            fi
-            exit 1
-          ' 2>/dev/null || true)"
-
-          if [ -z "${OPENSSL_BIN}" ]; then
-            echo "ERROR: cannot find openssl in container (OPENSSL_BIN is empty)" | tee -a env_info.txt
-            exit 1
-          fi
-
-          echo "OPENSSL_BIN=${OPENSSL_BIN}" | tee -a env_info.txt
-          echo "OPENSSL_BIN=${OPENSSL_BIN}" >> "${GITHUB_ENV}"
-
-      - name: Sanity check in container
-        timeout-minutes: 2
-        run: |
-          echo "=== Sanity check: openssl/python ===" | tee -a env_info.txt
-          echo "IMG=${IMG}" | tee -a env_info.txt
-          echo "OPENSSL_BIN=${OPENSSL_BIN}" | tee -a env_info.txt
-
-          docker run --rm "${IMG}" sh -lc "
+          set -e
+          docker run --rm "${IMG}" sh -lc '
+            set -e
             uname -a || true
-            echo
-            \"${OPENSSL_BIN}\" version -a || true
-            echo
-            \"${OPENSSL_BIN}\" list -providers || true
-            echo
-            \"${OPENSSL_BIN}\" list -groups 2>/dev/null | head -n 120 || true
-          " 2>&1 | tee -a env_info.txt
-
-          docker run --rm "${IMG}" sh -lc 'command -v python3 || true' 2>&1 | tee -a env_info.txt
+            echo "== openssl ==" && openssl version -a
+            echo "== providers ==" && openssl list -providers || true
+            echo "== groups (head) ==" && (openssl list -groups 2>/dev/null | head -n 80 || true)
+          ' | tee env_info.txt
 
       - name: Make scripts executable
         run: |
+          set -e
           chmod +x scripts/*.sh
 
-      - name: Environment info
+      - name: TLS handshake throughput (smoke)
         timeout-minutes: 2
         run: |
-          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" bash scripts/env_info.sh 2>&1 | tee -a env_info.txt
+          set -e
+          IMG="${IMG}" TIMESEC="${TIMESEC}" bash scripts/bench_tls.sh | tee tls_bench.txt
 
-      - name: TLS handshake throughput
-        timeout-minutes: 3
+      - name: TLS handshake latency (smoke)
+        timeout-minutes: 2
         run: |
-          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" TIMESEC="${TIMESEC}" \
-            bash scripts/bench_tls.sh 2>&1 | tee -a tls_bench.txt
+          set -e
+          IMG="${IMG}" N="${N}" bash scripts/bench_tls_latency.sh | tee tls_latency.txt
 
-      - name: TLS handshake latency
-        timeout-minutes: 3
+      - name: Signature benchmark (smoke)
+        timeout-minutes: 2
         run: |
-          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" N="${N}" \
-            bash scripts/bench_tls_latency.sh 2>&1 | tee -a tls_latency.txt
-
-      - name: Signature benchmark
-        timeout-minutes: 3
-        run: |
-          IMG="${IMG}" OPENSSL_BIN="${OPENSSL_BIN}" BENCH_SECONDS="${BENCH_SECONDS}" \
-            bash scripts/bench_sig.sh 2>&1 | tee -a sig_bench.txt
+          set -e
+          IMG="${IMG}" BENCH_SECONDS="${BENCH_SECONDS}" bash scripts/bench_sig.sh | tee sig_bench.txt
 
       - name: Upload results
         if: always()
