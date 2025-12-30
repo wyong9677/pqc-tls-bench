@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMG="${IMG:-openquantumsafe/oqs-ossl3:latest}"
+IMG="${IMG:?IMG is required}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 MODE="${MODE:-paper}"
 
-REPEATS="${REPEATS:-5}"
+REPEATS="${REPEATS:-7}"
 WARMUP="${WARMUP:-2}"
-TIMESEC="${TIMESEC:-15}"
+TIMESEC="${TIMESEC:-20}"
 
 if [ "${MODE}" = "smoke" ]; then
   REPEATS=2
@@ -25,16 +25,17 @@ cleanup() {
 trap cleanup EXIT
 
 csv="${RESULTS_DIR}/tls_throughput.csv"
-echo "run,mode,timesec,conn_user_sec" > "${csv}"
+rawdir="${RESULTS_DIR}/tls_throughput_raw"
+mkdir -p "${rawdir}"
+echo "repeat,mode,timesec,connections,user_sec,conn_user_sec,real_seconds" > "${csv}"
 
-echo "=== bench_tls.sh (throughput) ==="
-echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} timesec=${TIMESEC}"
+echo "=== TLS throughput (s_time) ==="
+echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} time=${TIMESEC}s"
 echo
 
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create "$NET" >/dev/null
 
-# start server once
 docker run -d --rm --name server --network "$NET" "${IMG}" sh -lc "
   set -e
   OPENSSL=/opt/openssl/bin/openssl
@@ -60,23 +61,34 @@ run_one() {
     set -e
     OPENSSL=/opt/openssl/bin/openssl
     [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
-    \"\$OPENSSL\" s_time -connect server:${PORT} -tls1_3 -new -time ${TIMESEC} -provider default 2>/dev/null
+    \"\$OPENSSL\" s_time -connect server:${PORT} -tls1_3 -new -time ${TIMESEC} -provider default
   " || true
 }
 
-# warmup
+# warmup (not recorded)
 for _ in $(seq 1 "${WARMUP}"); do
   run_one >/dev/null 2>&1 || true
 done
 
 for r in $(seq 1 "${REPEATS}"); do
   out="$(run_one)"
-  # extract "xxxx.xx connections/user sec"
-  val="$(printf "%s\n" "$out" | awk '/connections\/user sec/ {print $(NF-2); exit 0}')"
-  [ -n "${val}" ] || val="nan"
-  echo "run=${r} conn_user_sec=${val}"
-  echo "${r},${MODE},${TIMESEC},${val}" >> "${csv}"
+  printf "%s\n" "$out" > "${rawdir}/rep${r}.txt"
+
+  # parse: "XXXX connections in Y.YYs; Z.ZZ connections/user sec"
+  connections="$(printf "%s\n" "$out" | awk '/connections in/ {print $1; exit 0}')"
+  usersec="$(printf "%s\n" "$out" | awk '/connections in/ {gsub("s;","",$4); print $3; exit 0}')"
+  conn_user_sec="$(printf "%s\n" "$out" | awk '/connections\/user sec/ {print $(NF-2); exit 0}')"
+  realsec="$(printf "%s\n" "$out" | awk '/connections in [0-9.]+ real seconds/ {print $(NF-2); exit 0}')"
+
+  connections="${connections:-nan}"
+  usersec="${usersec:-nan}"
+  conn_user_sec="${conn_user_sec:-nan}"
+  realsec="${realsec:-nan}"
+
+  echo "rep=${r} conn_user_sec=${conn_user_sec}"
+  echo "${r},${MODE},${TIMESEC},${connections},${usersec},${conn_user_sec},${realsec}" >> "${csv}"
 done
 
 echo
-echo "CSV written: ${csv}"
+echo "CSV: ${csv}"
+echo "Raw: ${rawdir}/rep*.txt"
