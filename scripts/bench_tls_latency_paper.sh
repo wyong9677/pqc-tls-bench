@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 need docker
-need python3
+need python3  # host-only
 
 IMG="${IMG:?IMG is required}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
@@ -46,7 +46,7 @@ mkdir -p "${rawdir}"
 echo "repeat,mode,n,timeout_s,sample_idx,lat_ms,ok" > "${samples_csv}"
 echo "repeat,mode,n,timeout_s,ok,fail,p50_ms,p95_ms,p99_ms,mean_ms,std_ms" > "${summary_csv}"
 
-# CONFIG_JSON via env vars (bash-safe)
+# Host-only config JSON for meta.json
 CONFIG_JSON="$(
   TLS_PROVIDERS="${TLS_PROVIDERS}" \
   TLS_GROUPS="${TLS_GROUPS}" \
@@ -70,6 +70,7 @@ cfg = {
   "cert_keyalg": os.environ.get("TLS_CERT_KEYALG",""),
   "server_extra_args": os.environ.get("TLS_SERVER_EXTRA_ARGS",""),
   "client_extra_args": os.environ.get("TLS_CLIENT_EXTRA_ARGS",""),
+  "container_python": "not_used",
 }
 print(json.dumps(cfg))
 PY
@@ -82,7 +83,7 @@ info "providers=${TLS_PROVIDERS} groups=${TLS_GROUPS:-<default>} cert_keyalg=${T
 docker network rm "${NET}" >/dev/null 2>&1 || true
 docker network create "${NET}" >/dev/null
 
-# Start server container
+# --- Start server container ---
 docker run -d --rm --name "server-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc "
   set -e
   OPENSSL=/opt/openssl/bin/openssl
@@ -108,10 +109,10 @@ docker run -d --rm --name "server-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc 
     -quiet
 " >/dev/null
 
-# Start client container (idle)
+# --- Start client container (idle) ---
 docker run -d --rm --name "client-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc "sleep infinity" >/dev/null
 
-# Wait ready (still uses shell in container, but all $ are escaped inside the container string)
+# --- Wait ready ---
 ready=0
 for _ in $(seq 1 40); do
   if docker exec "client-${RUN_ID}" sh -lc "
@@ -128,78 +129,50 @@ for _ in $(seq 1 40); do
 done
 [ "${ready}" -eq 1 ] || die "TLS server not ready"
 
-# Warmup (use python invocation as well to avoid per-try docker exec overhead)
+# --- Warmup: container shell only ---
 docker exec "client-${RUN_ID}" sh -lc "
-  python3 - <<'PY'
-import os, shlex, subprocess, time
-WARMUP=int(os.environ['WARMUP'])
-TO=float(os.environ['TO'])
-host=os.environ['HOST']
-providers=os.environ.get('PROVIDERS','')
-groups=os.environ.get('GROUPS','')
-extra=os.environ.get('EXTRA','')
+  OPENSSL=/opt/openssl/bin/openssl
+  [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
+  PROVIDERS='${providers_args}'
+  GROUPS_ARG=''
+  if [ -n '${TLS_GROUPS}' ]; then GROUPS_ARG=\"-groups ${TLS_GROUPS}\"; fi
 
-openssl_bin='/opt/openssl/bin/openssl'
-args=[openssl_bin,'s_client','-connect',host,'-tls1_3','-brief']
-args+=shlex.split(providers)
-args+=shlex.split(groups)
-args+=shlex.split(extra)
+  i=1
+  while [ \$i -le ${WARMUP} ]; do
+    timeout ${ATTEMPT_TIMEOUT}s \"\$OPENSSL\" s_client -connect server-${RUN_ID}:${PORT} -tls1_3 -brief \${PROVIDERS} \${GROUPS_ARG} ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1 || true
+    i=\$((i+1))
+  done
+" >/dev/null 2>&1 || true
 
-for _ in range(WARMUP):
-    try:
-        subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TO)
-    except Exception:
-        pass
-PY
-" \
-WARMUP="${WARMUP}" TO="${ATTEMPT_TIMEOUT}" HOST="server-${RUN_ID}:${PORT}" \
-PROVIDERS="${providers_args}" GROUPS="${TLS_GROUPS:+-groups ${TLS_GROUPS}}" EXTRA="${TLS_CLIENT_EXTRA_ARGS}" \
->/dev/null 2>&1 || true
-
-# Main reps: one docker exec per rep; python uses subprocess.run(list) => no $OPENSSL on host
+# --- Reps: container shell only; one docker exec per rep ---
 for r in $(seq 1 "${REPEATS}"); do
   rawfile="${rawdir}/rep${r}.txt"
   info "RUN rep=${r}/${REPEATS}"
 
   docker exec "client-${RUN_ID}" sh -lc "
-    python3 - <<'PY'
-import os, shlex, subprocess, time, sys
+    set -e
+    OPENSSL=/opt/openssl/bin/openssl
+    [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
+    PROVIDERS='${providers_args}'
+    GROUPS_ARG=''
+    if [ -n '${TLS_GROUPS}' ]; then GROUPS_ARG=\"-groups ${TLS_GROUPS}\"; fi
 
-N=int(os.environ['N'])
-TO=float(os.environ['TO'])
-host=os.environ['HOST']
-providers=os.environ.get('PROVIDERS','')
-groups=os.environ.get('GROUPS','')
-extra=os.environ.get('EXTRA','')
+    i=1
+    while [ \$i -le ${N} ]; do
+      t0=\$(date +%s%N)
+      timeout ${ATTEMPT_TIMEOUT}s \"\$OPENSSL\" s_client -connect server-${RUN_ID}:${PORT} -tls1_3 -brief \${PROVIDERS} \${GROUPS_ARG} ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1
+      rc=\$?
+      t1=\$(date +%s%N)
+      ms=\$(awk -v a=\"\$t0\" -v b=\"\$t1\" 'BEGIN{printf \"%.4f\", (b-a)/1000000.0}')
+      ok=0; [ \$rc -eq 0 ] && ok=1
+      echo \"\$i,\$ms,\$ok\"
+      i=\$((i+1))
+    done
+  " | tee "${rawfile}" >/dev/null
 
-openssl_bin='/opt/openssl/bin/openssl'
-args=[openssl_bin,'s_client','-connect',host,'-tls1_3','-brief']
-args+=shlex.split(providers)
-args+=shlex.split(groups)
-args+=shlex.split(extra)
-
-for i in range(1, N+1):
-    t0=time.perf_counter_ns()
-    ok=1
-    try:
-        r=subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TO)
-        if r.returncode != 0:
-            ok=0
-    except Exception:
-        ok=0
-    t1=time.perf_counter_ns()
-    ms=(t1-t0)/1e6
-    sys.stdout.write(f\"{i},{ms:.4f},{ok}\\n\")
-PY
-  " \
-  N="${N}" TO="${ATTEMPT_TIMEOUT}" HOST="server-${RUN_ID}:${PORT}" \
-  PROVIDERS="${providers_args}" GROUPS="${TLS_GROUPS:+-groups ${TLS_GROUPS}}" EXTRA="${TLS_CLIENT_EXTRA_ARGS}" \
-  | tee "${rawfile}" >/dev/null
-
-  # Summarize rep on host and append to CSVs
+  # Host summarization
   python3 - <<PY
 import math, statistics
-
 raw_path=${rawfile!r}
 samples_csv=${samples_csv!r}
 summary_csv=${summary_csv!r}
@@ -245,11 +218,10 @@ with open(summary_csv,"a",encoding="utf-8") as out:
 
 print(f"[rep {rep}] ok={ok}/{N} p50={p50:.2f} p95={p95:.2f} p99={p99:.2f} mean={mean:.2f} std={std:.2f}")
 PY
-
 done
 
 echo
 echo "OK. Summary CSV: ${summary_csv}"
-echo "Samples CSV: ${samples_csv}"
+echo "OK. Samples CSV: ${samples_csv}"
 echo "Raw: ${rawdir}/rep*.txt"
 echo "Meta: ${OUTDIR}/meta.json"
