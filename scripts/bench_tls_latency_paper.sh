@@ -46,7 +46,7 @@ mkdir -p "${rawdir}"
 echo "repeat,mode,n,timeout_s,sample_idx,lat_ms,ok" > "${samples_csv}"
 echo "repeat,mode,n,timeout_s,ok,fail,p50_ms,p95_ms,p99_ms,mean_ms,std_ms" > "${summary_csv}"
 
-# Host-only config JSON for meta.json
+# Host-only config JSON for meta.json (SAFE: env -> python)
 CONFIG_JSON="$(
   TLS_PROVIDERS="${TLS_PROVIDERS}" \
   TLS_GROUPS="${TLS_GROUPS}" \
@@ -170,28 +170,40 @@ for r in $(seq 1 "${REPEATS}"); do
     done
   " | tee "${rawfile}" >/dev/null
 
-  # Host summarization
-  python3 - <<PY
-import math, statistics
-raw_path=${rawfile!r}
-samples_csv=${samples_csv!r}
-summary_csv=${summary_csv!r}
-rep=int(${r})
-mode=${MODE!r}
-N=int(${N})
-TO=float(${ATTEMPT_TIMEOUT})
+  # Host summarization (NO ${var!r}; pass via env)
+  RAW_PATH="${rawfile}" \
+  SAMPLES_CSV="${samples_csv}" \
+  SUMMARY_CSV="${summary_csv}" \
+  REP="${r}" \
+  MODE_STR="${MODE}" \
+  N_STR="${N}" \
+  TO_STR="${ATTEMPT_TIMEOUT}" \
+  python3 - <<'PY'
+import os, math, statistics
+
+raw_path = os.environ["RAW_PATH"]
+samples_csv = os.environ["SAMPLES_CSV"]
+summary_csv = os.environ["SUMMARY_CSV"]
+rep = int(os.environ["REP"])
+mode = os.environ["MODE_STR"]
+N = int(os.environ["N_STR"])
+TO = float(os.environ["TO_STR"])
 
 ok_vals=[]
-ok=0; fail=0
+ok=0
+fail=0
 
 with open(raw_path,"r",encoding="utf-8") as f:
     for line in f:
         line=line.strip()
-        if not line: continue
+        if not line:
+            continue
         i_s, ms_s, ok_s = line.split(",")
         i=int(i_s); ms=float(ms_s); ok_flag=int(ok_s)
+
         with open(samples_csv,"a",encoding="utf-8") as out:
-            out.write(f"{rep},{mode},{N},{TO},{i},{ms:.4f},{ok_flag}\\n")
+            out.write(f"{rep},{mode},{N},{TO},{i},{ms:.4f},{ok_flag}\n")
+
         if ok_flag==1:
             ok += 1
             ok_vals.append(ms)
@@ -200,10 +212,12 @@ with open(raw_path,"r",encoding="utf-8") as f:
 
 def pct(vals,p):
     vals=sorted(vals)
-    if not vals: return float("nan")
+    if not vals:
+        return float("nan")
     k=(len(vals)-1)*p/100.0
     f=int(math.floor(k)); c=int(math.ceil(k))
-    if f==c: return vals[f]
+    if f==c:
+        return vals[f]
     return vals[f]*(c-k)+vals[c]*(k-f)
 
 if ok_vals:
@@ -214,7 +228,7 @@ else:
     mean=std=p50=p95=p99=float("nan")
 
 with open(summary_csv,"a",encoding="utf-8") as out:
-    out.write(f"{rep},{mode},{N},{TO},{ok},{fail},{p50:.4f},{p95:.4f},{p99:.4f},{mean:.4f},{std:.4f}\\n")
+    out.write(f"{rep},{mode},{N},{TO},{ok},{fail},{p50:.4f},{p95:.4f},{p99:.4f},{mean:.4f},{std:.4f}\n")
 
 print(f"[rep {rep}] ok={ok}/{N} p50={p50:.2f} p95={p95:.2f} p99={p99:.2f} mean={mean:.2f} std={std:.2f}")
 PY
