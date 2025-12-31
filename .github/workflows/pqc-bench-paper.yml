@@ -17,6 +17,7 @@ jobs:
 
     env:
       IMG_BASE: openquantumsafe/oqs-ossl3:latest
+      RESULTS_DIR: results
 
     steps:
       - name: Checkout
@@ -27,6 +28,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Prepare dirs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULTS_DIR}"
+
       - name: Pull image and lock digest
         shell: bash
         run: |
@@ -34,13 +41,75 @@ jobs:
           docker pull "${IMG_BASE}"
           DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG_BASE}")"
           echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
-          echo "${DIGEST}" | tee image_digest.txt
+          echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
 
-      - name: Run all benchmarks (single entry)
+      - name: Compute RUN_ID + knobs
         shell: bash
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}" IMG="${IMG}" bash scripts/run_all.sh
+          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+          SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
+          RUN_ID="${TS}${SHA:+_${SHA}}"
+          echo "RUN_ID=${RUN_ID}" >> "$GITHUB_ENV"
+          echo "RUN_DIR=${RESULTS_DIR}/${RUN_ID}" >> "$GITHUB_ENV"
+          mkdir -p "${RESULTS_DIR}/${RUN_ID}"
+
+          MODE="${{ inputs.mode }}"
+          echo "MODE=${MODE}" >> "$GITHUB_ENV"
+
+          if [ "${MODE}" = "smoke" ]; then
+            echo "REPEATS=1" >> "$GITHUB_ENV"
+            echo "WARMUP=1" >> "$GITHUB_ENV"
+            echo "TIMESEC=5" >> "$GITHUB_ENV"
+            echo "N=50" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=2" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=5" >> "$GITHUB_ENV"
+            echo "STRICT=0" >> "$GITHUB_ENV"
+          else
+            echo "REPEATS=5" >> "$GITHUB_ENV"
+            echo "WARMUP=2" >> "$GITHUB_ENV"
+            echo "TIMESEC=15" >> "$GITHUB_ENV"
+            echo "N=200" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=3" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=15" >> "$GITHUB_ENV"
+            echo "STRICT=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Make scripts executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/*.sh || true
+          chmod +x scripts/*.py || true
+          chmod +x scripts/core/*.sh || true
+
+      - name: Run (container uses sh, not bash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[INFO] MODE=${MODE}"
+          echo "[INFO] IMG=${IMG}"
+          echo "[INFO] RUN_DIR=${RUN_DIR}"
+
+          # host meta
+          python3 scripts/write_meta.py "${RUN_DIR}" "${MODE}" "${IMG}" "$(git rev-parse --short HEAD || true)" \
+            "${REPEATS}" "${WARMUP}" "${TIMESEC}" "${N}" "${ATTEMPT_TIMEOUT}" "${BENCH_SECONDS}" "${STRICT}" \
+            | tee "${RUN_DIR}/meta_path.log"
+
+          # env info (container: sh)
+          docker run --rm \
+            -v "${PWD}:/work:ro" -w /work \
+            -v "${PWD}/${RUN_DIR}:/out" \
+            "${IMG}" sh /work/scripts/core/env_info_core.sh /out \
+            |& tee "${RUN_DIR}/env_info.log"
+
+          # signature bench (container: sh)
+          docker run --rm \
+            -v "${PWD}:/work:ro" -w /work \
+            -v "${PWD}/${RUN_DIR}:/out" \
+            -e MODE -e REPEATS -e WARMUP -e BENCH_SECONDS -e STRICT \
+            "${IMG}" sh /work/scripts/core/sig_bench_core.sh /out \
+            |& tee "${RUN_DIR}/sig_bench.log"
 
       - name: Upload results
         if: always()
