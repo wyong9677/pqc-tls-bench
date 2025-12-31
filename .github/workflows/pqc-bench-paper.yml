@@ -19,14 +19,6 @@ jobs:
       IMG_BASE: openquantumsafe/oqs-ossl3:latest
       RESULTS_DIR: results
 
-      # paper 默认（脚本内如支持 MODE=smoke 可自行降档）
-      REPEATS: "5"
-      WARMUP: "2"
-      TIMESEC: "15"
-      N: "200"
-      ATTEMPT_TIMEOUT: "3"
-      BENCH_SECONDS: "15"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,43 +41,86 @@ jobs:
           echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
           echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
 
+      - name: Compute RUN_ID and mode-specific knobs
+        run: |
+          set -euo pipefail
+
+          # RUN_ID: UTC + short sha (best-effort)
+          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+          SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then RUN_ID="${TS}_${SHA}"; else RUN_ID="${TS}"; fi
+          echo "RUN_ID=${RUN_ID}" >> "$GITHUB_ENV"
+          echo "RUN_DIR=${RESULTS_DIR}/${RUN_ID}" >> "$GITHUB_ENV"
+          mkdir -p "${RESULTS_DIR}/${RUN_ID}"
+
+          MODE="${{ inputs.mode }}"
+          echo "MODE=${MODE}" >> "$GITHUB_ENV"
+
+          # Time budget control:
+          # smoke: fast sanity check (keeps within CI and reduces flakiness)
+          # paper: publication-grade defaults
+          if [ "${MODE}" = "smoke" ]; then
+            echo "REPEATS=2" >> "$GITHUB_ENV"
+            echo "WARMUP=1" >> "$GITHUB_ENV"
+            echo "TIMESEC=5" >> "$GITHUB_ENV"
+            echo "N=50" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=2" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=5" >> "$GITHUB_ENV"
+            echo "STRICT=0" >> "$GITHUB_ENV"
+          else
+            echo "REPEATS=5" >> "$GITHUB_ENV"
+            echo "WARMUP=2" >> "$GITHUB_ENV"
+            echo "TIMESEC=15" >> "$GITHUB_ENV"
+            echo "N=200" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=3" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=15" >> "$GITHUB_ENV"
+            echo "STRICT=1" >> "$GITHUB_ENV"
+          fi
+
       - name: Make scripts executable
         run: |
           set -euo pipefail
           chmod +x scripts/*.sh
+          chmod +x scripts/*.py || true
 
-      - name: Env info (paper)
+      # NOTE:
+      # All scripts write into results/<RUN_ID>/... so we tee logs there too
+
+      - name: Env info
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
-            bash scripts/env_info_paper.sh |& tee "${RESULTS_DIR}/env_info.txt"
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+            bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
 
-      - name: TLS throughput (paper)
+      - name: TLS throughput (classic baseline example)
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
-            bash scripts/bench_tls_paper.sh |& tee "${RESULTS_DIR}/tls_throughput.txt"
+            TLS_PROVIDERS="default" TLS_CERT_KEYALG="ec_p256" TLS_GROUPS="X25519" \
+            bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
 
-      - name: TLS latency (paper)
+      - name: TLS latency (classic baseline example)
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-            bash scripts/bench_tls_latency_paper.sh |& tee "${RESULTS_DIR}/tls_latency.txt"
+            TLS_PROVIDERS="default" TLS_CERT_KEYALG="ec_p256" TLS_GROUPS="X25519" \
+            bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
 
-      - name: Signature benchmark (paper)
+      - name: Signature benchmark (includes ECDSA baseline)
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" \
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" \
-            bash scripts/bench_sig_paper.sh |& tee "${RESULTS_DIR}/sig_bench.txt"
+            STRICT="${STRICT}" \
+            bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
 
-      - name: Summarize results
+      - name: Summarize results (paper tables + JSON)
         run: |
           set -euo pipefail
-          python3 scripts/summarize_results.py "${RESULTS_DIR}" \
-            | tee "${RESULTS_DIR}/paper_tables.md"
+          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
+          # paper_tables.md is written to RUN_DIR by summarize_results.py
 
       - name: Upload results
         if: always()
