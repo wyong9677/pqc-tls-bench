@@ -8,10 +8,13 @@ def read_csv(path):
 
 def to_float(x):
     try:
-        if x is None: return float("nan")
+        if x is None:
+            return float("nan")
         if isinstance(x, str):
-            if x.strip() == "": return float("nan")
-            if x.lower() == "nan": return float("nan")
+            s = x.strip()
+            if s == "" or s.lower() == "nan":
+                return float("nan")
+            return float(s)
         return float(x)
     except Exception:
         return float("nan")
@@ -21,9 +24,12 @@ def clean(vals):
 
 def mean_std(vals):
     vals = clean(vals)
-    if not vals: return float("nan"), float("nan")
-    if len(vals) == 1: return vals[0], 0.0
-    return statistics.mean(vals), statistics.pstdev(vals)
+    if not vals:
+        return float("nan"), float("nan")
+    if len(vals) == 1:
+        return vals[0], 0.0
+    # sample std (n-1) is more standard for reporting variability
+    return statistics.mean(vals), statistics.stdev(vals)
 
 def bootstrap_ci(vals, iters=2000, alpha=0.05, seed=7):
     vals = clean(vals)
@@ -40,112 +46,125 @@ def bootstrap_ci(vals, iters=2000, alpha=0.05, seed=7):
     hi = means[int((1-alpha/2)*iters)-1]
     return lo, hi
 
-def f(x, nd=2):
-    if x is None: return "—"
-    if isinstance(x, float) and math.isnan(x): return "—"
+def fmt(x, nd=2):
+    if x is None:
+        return "—"
+    if isinstance(x, float) and math.isnan(x):
+        return "—"
     return f"{x:.{nd}f}"
 
-def nan_to_none(x):
-    if isinstance(x, float) and math.isnan(x):
-        return None
-    if isinstance(x, dict):
-        return {k: nan_to_none(v) for k, v in x.items()}
-    if isinstance(x, list):
-        return [nan_to_none(v) for v in x]
-    return x
+def fmt_pm(mean, std, nd=1):
+    if mean is None or (isinstance(mean, float) and math.isnan(mean)):
+        return "—"
+    if std is None or (isinstance(std, float) and math.isnan(std)):
+        return "—"
+    return f"{mean:.{nd}f}±{std:.{nd}f}"
 
 def main(results_dir):
-    out = []
-    js = {"tls_throughput": {}, "tls_latency_adj": {}, "sig_speed": {}}
+    out=[]
+    js={"tls_throughput":{}, "tls_latency_adj":{}, "sig_speed":{}}
 
-    # TLS throughput
-    tp = os.path.join(results_dir, "tls_throughput.csv")
+    # ================= TLS throughput =================
+    tp=os.path.join(results_dir,"tls_throughput.csv")
     if os.path.exists(tp):
-        rows = read_csv(tp)
-        vals = [to_float(r.get("conn_user_sec")) for r in rows]
-        m, s = mean_std(vals)
-        lo, hi = bootstrap_ci(vals)
+        rows=read_csv(tp)
+        vals=[to_float(r.get("conn_user_sec")) for r in rows]
+        m,s=mean_std(vals)
+        lo,hi=bootstrap_ci(vals)
         out.append("## TLS Throughput (OpenSSL s_time)\n")
-        out.append(f"- repeats={len(clean(vals))} mean={f(m)} conn/user-sec, std={f(s)}, 95% CI=[{f(lo)}, {f(hi)}]\n\n")
-        js["tls_throughput"] = {"n": len(clean(vals)), "mean": m, "std": s, "ci95": [lo, hi]}
+        out.append(
+            f"- repeats={len(clean(vals))} mean={fmt(m)} conn/user-sec, "
+            f"std={fmt(s)}, 95% CI=[{fmt(lo)}, {fmt(hi)}]\n\n"
+        )
+        js["tls_throughput"]={"n":len(clean(vals)),"mean":m,"std":s,"ci95":[lo,hi]}
 
-    # TLS latency adjusted
-    lat = os.path.join(results_dir, "tls_latency_summary.csv")
+    # ================= TLS latency =================
+    lat=os.path.join(results_dir,"tls_latency_summary.csv")
     if os.path.exists(lat):
-        rows = read_csv(lat)
+        rows=read_csv(lat)
         metrics = {
-            "p50": [to_float(r.get("adj_p50_ms")) for r in rows],
-            "p95": [to_float(r.get("adj_p95_ms")) for r in rows],
-            "p99": [to_float(r.get("adj_p99_ms")) for r in rows],
-            "mean": [to_float(r.get("adj_mean_ms")) for r in rows],
+            "p50":[to_float(r.get("adj_p50_ms")) for r in rows],
+            "p95":[to_float(r.get("adj_p95_ms")) for r in rows],
+            "p99":[to_float(r.get("adj_p99_ms")) for r in rows],
+            "mean":[to_float(r.get("adj_mean_ms")) for r in rows],
         }
         out.append("## TLS Latency (Adjusted: docker exec baseline removed)\n")
+        js["tls_latency_adj"]={}
         for name, vals in metrics.items():
-            m, s = mean_std(vals)
-            lo, hi = bootstrap_ci(vals)
-            out.append(f"- {name}: mean={f(m)} ms, std={f(s)}, 95% CI=[{f(lo)}, {f(hi)}]\n")
-            js["tls_latency_adj"][name] = {"n": len(clean(vals)), "mean": m, "std": s, "ci95": [lo, hi]}
+            m,s=mean_std(vals)
+            lo,hi=bootstrap_ci(vals)
+            out.append(f"- {name}: mean={fmt(m)} ms, std={fmt(s)}, 95% CI=[{fmt(lo)}, {fmt(hi)}]\n")
+            js["tls_latency_adj"][name]={"n":len(clean(vals)),"mean":m,"std":s,"ci95":[lo,hi]}
         out.append("\n")
 
-    # Signature speed
-    sig = os.path.join(results_dir, "sig_speed.csv")
+    # ================= Signature speed =================
+    sig=os.path.join(results_dir,"sig_speed.csv")
     if os.path.exists(sig):
-        rows = read_csv(sig)
+        rows=read_csv(sig)
 
-        # If ok column exists, only keep ok==1
-        if rows and "ok" in rows[0]:
-            rows = [r for r in rows if str(r.get("ok", "")).strip() == "1"]
+        # If CSV has ok column, keep only ok==1
+        has_ok = ("ok" in rows[0]) if rows else False
+        if has_ok:
+            rows = [r for r in rows if str(r.get("ok","")).strip() == "1"]
 
-        by_alg = defaultdict(lambda: {"keygens": [], "sign": [], "verify": []})
+        by_alg=defaultdict(lambda: {"keygens":[], "sign":[], "verify":[]})
         for r in rows:
-            alg = (r.get("alg") or "").strip()
+            alg=(r.get("alg") or "").strip()
             if not alg:
                 continue
             by_alg[alg]["keygens"].append(to_float(r.get("keygens_s")))
             by_alg[alg]["sign"].append(to_float(r.get("sign_s")))
             by_alg[alg]["verify"].append(to_float(r.get("verify_s")))
 
+        # Stable, paper-friendly ordering
+        preferred = ["ecdsap256","mldsa44","mldsa65","falcon512","falcon1024"]
+        algs = [a for a in preferred if a in by_alg] + sorted([a for a in by_alg if a not in preferred])
+
         out.append("## Signature Micro-benchmark (OpenSSL speed)\n")
         out.append("| Algorithm | KeyGen (mean±std) | Sign (mean±std) | Verify (mean±std) |\n")
         out.append("|---|---:|---:|---:|\n")
+        js["sig_speed"]={}
 
-        for alg, d in by_alg.items():
-            km, ks = mean_std(d["keygens"])
-            sm, ss = mean_std(d["sign"])
-            vm, vs = mean_std(d["verify"])
+        for alg in algs:
+            d = by_alg[alg]
+            km,ks=mean_std(d["keygens"])
+            sm,ss=mean_std(d["sign"])
+            vm,vs=mean_std(d["verify"])
 
-            # ECDSA: do not report keygen (OpenSSL speed doesn't provide it)
+            # ECDSA: keygen is not reported (avoid misleading)
             if alg.lower().startswith("ecdsa"):
-                keygen_cell = "—"
-                js_keygen = None
+                keygen_cell="—"
+                js_keygen=None
             else:
-                keygen_cell = f"{f(km,1)}±{f(ks,1)}" if not math.isnan(km) else "—"
-                js_keygen = {"mean": km, "std": ks} if not math.isnan(km) else None
+                keygen_cell=fmt_pm(km,ks,nd=1) if len(clean(d["keygens"]))>0 else "—"
+                js_keygen={"mean":km,"std":ks} if len(clean(d["keygens"]))>0 else None
 
-            sign_cell = f"{f(sm,1)}±{f(ss,1)}" if not math.isnan(sm) else "—"
-            verify_cell = f"{f(vm,1)}±{f(vs,1)}" if not math.isnan(vm) else "—"
+            sign_cell = fmt_pm(sm,ss,nd=1) if len(clean(d["sign"]))>0 else "—"
+            verify_cell = fmt_pm(vm,vs,nd=1) if len(clean(d["verify"]))>0 else "—"
 
             out.append(f"| {alg} | {keygen_cell} | {sign_cell} | {verify_cell} |\n")
 
-            js["sig_speed"][alg] = {
+            js["sig_speed"][alg]={
                 "keygens": js_keygen,
-                "sign": {"mean": sm, "std": ss} if not math.isnan(sm) else None,
-                "verify": {"mean": vm, "std": vs} if not math.isnan(vm) else None,
+                "sign": ({"mean":sm,"std":ss} if len(clean(d["sign"]))>0 else None),
+                "verify": ({"mean":vm,"std":vs} if len(clean(d["verify"]))>0 else None),
             }
 
-        out.append("\n*Note: ECDSA key generation is not benchmarked by OpenSSL speed; only signing and verification throughput are reported.*\n\n")
+        out.append(
+            "\n*Note: ECDSA key generation is not benchmarked by OpenSSL speed; "
+            "only signing and verification throughput are reported.*\n\n"
+        )
 
-    # Write strict JSON (no NaN)
-    js_strict = nan_to_none(js)
-    with open(os.path.join(results_dir, "paper_summary.json"), "w", encoding="utf-8") as fjson:
-        json.dump(js_strict, fjson, indent=2, allow_nan=False)
+    # ================= write JSON =================
+    with open(os.path.join(results_dir,"paper_summary.json"),"w",encoding="utf-8") as fjson:
+        json.dump(js,fjson,indent=2)
 
     print("# Paper-ready Benchmark Tables\n")
     print("".join(out))
     print(f"\n(Artifacts) paper_summary.json written under {results_dir}\n")
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
+if __name__=="__main__":
+    if len(sys.argv)!=2:
         print("usage: summarize_results_paper.py <results_dir>", file=sys.stderr)
         sys.exit(2)
     main(sys.argv[1])
