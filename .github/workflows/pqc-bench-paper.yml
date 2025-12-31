@@ -43,25 +43,105 @@ jobs:
           echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
           echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
 
+      - name: Compute RUN_ID + mode knobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+          SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then RUN_ID="${TS}_${SHA}"; else RUN_ID="${TS}"; fi
+
+          echo "MODE=${{ inputs.mode }}" >> "$GITHUB_ENV"
+          echo "RUN_ID=${RUN_ID}" >> "$GITHUB_ENV"
+          echo "RUN_DIR=${RESULTS_DIR}/${RUN_ID}" >> "$GITHUB_ENV"
+
+          mkdir -p "${RESULTS_DIR}/${RUN_ID}"
+
+          # smoke/paper 参数：统一由 workflow 管理，run_all.sh 只读这些 env
+          if [ "${{ inputs.mode }}" = "smoke" ]; then
+            echo "REPEATS=2" >> "$GITHUB_ENV"
+            echo "WARMUP=1" >> "$GITHUB_ENV"
+            echo "TIMESEC=5" >> "$GITHUB_ENV"
+            echo "N=50" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=2" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=5" >> "$GITHUB_ENV"
+            echo "STRICT=0" >> "$GITHUB_ENV"
+          else
+            echo "REPEATS=5" >> "$GITHUB_ENV"
+            echo "WARMUP=2" >> "$GITHUB_ENV"
+            echo "TIMESEC=15" >> "$GITHUB_ENV"
+            echo "N=200" >> "$GITHUB_ENV"
+            echo "ATTEMPT_TIMEOUT=3" >> "$GITHUB_ENV"
+            echo "BENCH_SECONDS=15" >> "$GITHUB_ENV"
+            echo "STRICT=1" >> "$GITHUB_ENV"
+          fi
+
       - name: Make scripts executable
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x scripts/*.sh scripts/run_all.sh || true
+          chmod +x scripts/*.sh || true
           chmod +x scripts/core/*.sh || true
           chmod +x scripts/*.py || true
+          # single entrypoint might not exist; don't fail here
+          chmod +x scripts/run_all.sh 2>/dev/null || true
 
-      - name: Run (single entrypoint)
+      - name: Debug list scripts (prevent missing-file surprises)
         shell: bash
         run: |
           set -euo pipefail
-          MODE="${{ inputs.mode }}"
+          echo "=== repo root ==="
+          ls -la
+          echo "=== scripts/ ==="
+          ls -la scripts || true
+          echo "=== scripts/core/ ==="
+          ls -la scripts/core || true
+          echo "=== find run_all ==="
+          find . -maxdepth 2 -type f -name "*run_all*" -print || true
+
+      - name: Run (prefer single entrypoint, fallback to steps)
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "[INFO] MODE=${MODE}"
           echo "[INFO] IMG=${IMG}"
           echo "[INFO] RESULTS_DIR=${RESULTS_DIR}"
+          echo "[INFO] RUN_ID=${RUN_ID}"
+          echo "[INFO] RUN_DIR=${RUN_DIR}"
 
-          # 统一入口：所有 RUN_DIR / meta / docker run 都由 run_all.sh 管理
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" bash scripts/run_all.sh
+          # If scripts/run_all.sh exists, use it (single entrypoint).
+          # Otherwise, run the pipeline steps directly (fallback).
+          if [ -f "scripts/run_all.sh" ]; then
+            echo "[INFO] Using single entrypoint: scripts/run_all.sh"
+            MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" RUN_DIR="${RUN_DIR}" \
+              REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
+              N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
+              bash scripts/run_all.sh |& tee "${RUN_DIR}/run_all.log"
+          else
+            echo "[WARN] scripts/run_all.sh not found. Falling back to step-by-step pipeline."
+
+            # Env info
+            MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+              bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
+
+            # TLS throughput
+            MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+              REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
+              bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
+
+            # TLS latency
+            MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+              REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
+              bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
+
+            # Signature bench
+            MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+              REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
+              bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
+
+            # Summarize
+            python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
+          fi
 
       - name: Upload results
         if: always()
