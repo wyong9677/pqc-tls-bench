@@ -1,95 +1,83 @@
 #!/usr/bin/env bash
+# Common utilities for paper-grade PQC/TLS benchmarks
+# Safe to source from other scripts.
 set -euo pipefail
 
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-die() { echo "[ERROR] $(ts) $*" 1>&2; exit 1; }
+info() { echo "[INFO] $(ts) $*"; }
+warn() { echo "[WARN] $(ts) $*" >&2; }
+die()  { echo "[ERROR] $(ts) $*" >&2; exit 1; }
 
-info() { echo "[INFO] $(ts) $*" 1>&2; }
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
 
-warn() { echo "[WARN] $(ts) $*" 1>&2; }
-
-need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
-
-# run_id: UTC timestamp + short git sha (if available)
 default_run_id() {
-  local t sha
-  t="$(date -u +"%Y%m%dT%H%M%SZ")"
+  local ts sha
+  ts="$(date -u +'%Y%m%dT%H%M%SZ')"
   sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
-  if [ -n "${sha}" ]; then echo "${t}_${sha}"; else echo "${t}"; fi
+  if [ -n "${sha}" ]; then echo "${ts}_${sha}"; else echo "${ts}"; fi
 }
 
-# Convert comma-separated providers into "-provider X -provider Y"
+# providers_to_args "default" -> "-provider default"
+# providers_to_args "oqs"     -> "-provider oqsprovider -provider default"
+# providers_to_args "default,oqs" -> "-provider default -provider oqsprovider -provider default" (order kept)
 providers_to_args() {
-  local p="$1" out=""
-  IFS=',' read -r -a arr <<<"$p"
+  local p="${1:-default}"
+  local out=()
+  IFS=',' read -r -a arr <<< "${p}"
   for x in "${arr[@]}"; do
-    x="$(echo "$x" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    [ -n "$x" ] && out="${out} -provider ${x}"
+    case "${x}" in
+      default) out+=("-provider" "default") ;;
+      oqs|oqsprovider) out+=("-provider" "oqsprovider" "-provider" "default") ;;
+      *)
+        die "unknown provider tag: ${x} (expected: default|oqs)"
+        ;;
+    esac
   done
-  echo "$out"
+  printf "%q " "${out[@]}"
 }
 
-# Write meta.json for a run (paper-grade provenance)
-# Usage: write_meta_json "<outdir>" "<mode>" "<img_digest>" "<config_json_string>"
+# write_meta_json OUTDIR MODE IMG CONFIG_JSON
+# - host-side python only; no ${var!r} bash substitution; values passed via env
 write_meta_json() {
-  local outdir="$1"
-  local mode="$2"
-  local img="$3"
-  local config_json="$4"
-
+  local outdir="$1" mode="$2" img="$3" config_json="$4"
+  need python3
   mkdir -p "${outdir}"
 
-  # git sha best-effort
-  local git_sha
-  git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
-
-  # IMPORTANT:
-  # Do NOT embed bash variables into python code with ${var!r}.
-  # Pass everything via environment variables to avoid shell substitution issues.
-  OUTDIR="${outdir}" \
-  MODE="${mode}" \
-  IMG="${img}" \
-  GIT_SHA="${git_sha}" \
-  CONFIG_JSON="${config_json}" \
+  OUTDIR="${outdir}" MODE="${mode}" IMG="${img}" CONFIG_JSON="${config_json}" \
   python3 - <<'PY'
-import json, os, platform, subprocess, datetime
+import os, json, platform, subprocess, datetime
 
-outdir = os.environ.get("OUTDIR","")
-mode = os.environ.get("MODE","")
-img = os.environ.get("IMG","")
-git_sha = os.environ.get("GIT_SHA","")
-config_raw = os.environ.get("CONFIG_JSON","")
+outdir=os.environ["OUTDIR"]
+mode=os.environ.get("MODE","")
+img=os.environ.get("IMG","")
+cfg=os.environ.get("CONFIG_JSON","{}")
 
 def sh(cmd):
     try:
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)[:4000]
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)[:8000]
     except Exception as e:
         return f"ERROR: {e}"
 
-try:
-    config = json.loads(config_raw) if config_raw else {}
-except Exception as e:
-    config = {"_config_json_parse_error": str(e), "_config_json_raw": config_raw[:2000]}
-
 meta = {
-    "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
-    "mode": mode,
-    "img": img,
-    "git_sha": git_sha,
-    "host": {
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-    },
-    "docker": {
-        "version": sh(["docker","--version"]),
-    },
-    "config": config,
+  "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+  "mode": mode,
+  "img": img,
+  "git_sha": sh(["git","rev-parse","HEAD"]).strip(),
+  "host": {
+    "platform": platform.platform(),
+    "python": platform.python_version(),
+  },
+  "docker": {
+    "version": sh(["docker","--version"]).strip(),
+  },
+  "config": json.loads(cfg) if cfg else {},
 }
 
-path = os.path.join(outdir, "meta.json")
-with open(path, "w", encoding="utf-8") as f:
+with open(os.path.join(outdir, "meta.json"), "w", encoding="utf-8") as f:
     json.dump(meta, f, indent=2)
-print(path)
+print(os.path.join(outdir,"meta.json"))
 PY
 }
