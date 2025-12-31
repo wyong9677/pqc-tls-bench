@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------
-# inputs
-# -------------------------
 MODE="${MODE:-paper}"
 IMG="${IMG:?IMG is required (e.g. openquantumsafe/oqs-ossl3:latest)}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 
-# -------------------------
-# run id
-# -------------------------
 TS="$(date -u +'%Y%m%dT%H%M%SZ')"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
 RUN_ID="${TS}${SHA:+_${SHA}}"
 RUN_DIR="${RESULTS_DIR}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
 
-# -------------------------
-# knobs
-# -------------------------
 if [ "${MODE}" = "smoke" ]; then
   REPEATS="${REPEATS:-1}"
   WARMUP="${WARMUP:-1}"
@@ -42,18 +33,14 @@ echo "[INFO] MODE=${MODE}"
 echo "[INFO] IMG=${IMG}"
 echo "[INFO] RUN_DIR=${RUN_DIR}"
 
-# -------------------------
-# meta (FIXED: argparse flags)
-# -------------------------
+# write meta (argparse flags)
 python3 scripts/write_meta.py \
   --outdir "${RUN_DIR}" \
   --mode "${MODE}" \
   --img "${IMG}" \
   --git_sha "${SHA:-}"
 
-# -------------------------
-# env info (container uses sh only)
-# -------------------------
+# Container: use sh only (oqs-ossl3 may not have bash)
 docker run --rm \
   -v "$(pwd):/work:ro" -w /work \
   -v "${RUN_DIR}:/out" \
@@ -61,9 +48,6 @@ docker run --rm \
   "${IMG}" sh /work/scripts/core/env_info_core.sh /out \
   |& tee "${RUN_DIR}/env_info.log"
 
-# -------------------------
-# signature benchmark
-# -------------------------
 docker run --rm \
   -v "$(pwd):/work:ro" -w /work \
   -v "${RUN_DIR}:/out" \
