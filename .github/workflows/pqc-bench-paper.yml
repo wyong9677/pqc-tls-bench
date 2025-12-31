@@ -1,34 +1,77 @@
-      - name: Run paper benchmark pipeline
-        shell: bash
+name: pqc-bench
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      IMG: openquantumsafe/oqs-ossl3:latest
+      TIMESEC: "5"
+      N: "10"
+      ATTEMPT_TIMEOUT: "2"
+      BENCH_SECONDS: "2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show repo layout
         run: |
           set -euo pipefail
+          pwd
+          ls -la
+          ls -la scripts || true
 
-          echo "[INFO] MODE=${MODE}"
-          echo "[INFO] IMG=${IMG}"
-          echo "[INFO] RESULTS_DIR=${RESULTS_DIR}"
-          echo "[INFO] RUN_ID=${RUN_ID}"
-          echo "[INFO] RUN_DIR=${RUN_DIR}"
+      - name: Pull OQS image
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          docker pull "${IMG}"
 
-          export OUTDIR="${RUN_DIR}"
+      - name: Make scripts executable
+        run: |
+          set -euo pipefail
+          chmod +x scripts/*.sh
 
-          echo "[INFO] === env_info_paper ==="
-          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
-            bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
+      - name: Environment info
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          IMG="${IMG}" bash scripts/env_info.sh |& tee env_info.txt
 
-          echo "[INFO] === bench_tls_paper ==="
-          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
-            bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
+      - name: TLS handshake throughput (smoke)
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          IMG="${IMG}" TIMESEC="${TIMESEC}" bash scripts/bench_tls.sh |& tee tls_bench.txt
 
-          echo "[INFO] === bench_tls_latency_paper ==="
-          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-            bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
+      - name: TLS handshake latency (smoke)
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          IMG="${IMG}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" bash scripts/bench_tls_latency.sh |& tee tls_latency.txt
 
-          echo "[INFO] === bench_sig_paper ==="
-          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
-            bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
+      - name: Signature benchmark (smoke)
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          IMG="${IMG}" BENCH_SECONDS="${BENCH_SECONDS}" bash scripts/bench_sig.sh |& tee sig_bench.txt
 
-          echo "[INFO] === summarize_results ==="
-          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqc-bench-results
+          path: |
+            env_info.txt
+            tls_bench.txt
+            tls_latency.txt
+            sig_bench.txt
