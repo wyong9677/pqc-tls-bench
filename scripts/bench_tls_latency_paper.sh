@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
 need docker
@@ -16,7 +17,6 @@ WARMUP="${WARMUP:-2}"
 N="${N:-200}"
 ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT:-3}"
 
-# TLS config (same knobs as throughput)
 TLS_PROVIDERS="${TLS_PROVIDERS:-default}"
 TLS_GROUPS="${TLS_GROUPS:-}"
 TLS_CERT_KEYALG="${TLS_CERT_KEYALG:-ec_p256}"
@@ -46,20 +46,32 @@ mkdir -p "${rawdir}"
 echo "repeat,mode,n,timeout_s,sample_idx,lat_ms,ok" > "${samples_csv}"
 echo "repeat,mode,n,timeout_s,ok,fail,p50_ms,p95_ms,p99_ms,mean_ms,std_ms" > "${summary_csv}"
 
-CONFIG_JSON="$(python3 - <<PY
-import json
-print(json.dumps({
+# ---- FIX: generate CONFIG_JSON via env vars (no ${VAR!r}) ----
+CONFIG_JSON="$(
+  TLS_PROVIDERS="${TLS_PROVIDERS}" \
+  TLS_GROUPS="${TLS_GROUPS}" \
+  TLS_CERT_KEYALG="${TLS_CERT_KEYALG}" \
+  TLS_SERVER_EXTRA_ARGS="${TLS_SERVER_EXTRA_ARGS}" \
+  TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS}" \
+  REPEATS="${REPEATS}" \
+  WARMUP="${WARMUP}" \
+  N="${N}" \
+  ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
+  python3 - <<'PY'
+import os, json
+cfg = {
   "benchmark": "tls_latency",
-  "repeats": int(${REPEATS}),
-  "warmup": int(${WARMUP}),
-  "n": int(${N}),
-  "timeout_s": float(${ATTEMPT_TIMEOUT}),
-  "providers": ${TLS_PROVIDERS!r},
-  "groups": ${TLS_GROUPS!r},
-  "cert_keyalg": ${TLS_CERT_KEYALG!r},
-  "server_extra_args": ${TLS_SERVER_EXTRA_ARGS!r},
-  "client_extra_args": ${TLS_CLIENT_EXTRA_ARGS!r},
-}))
+  "repeats": int(os.environ["REPEATS"]),
+  "warmup": int(os.environ["WARMUP"]),
+  "n": int(os.environ["N"]),
+  "timeout_s": float(os.environ["ATTEMPT_TIMEOUT"]),
+  "providers": os.environ.get("TLS_PROVIDERS",""),
+  "groups": os.environ.get("TLS_GROUPS",""),
+  "cert_keyalg": os.environ.get("TLS_CERT_KEYALG",""),
+  "server_extra_args": os.environ.get("TLS_SERVER_EXTRA_ARGS",""),
+  "client_extra_args": os.environ.get("TLS_CLIENT_EXTRA_ARGS",""),
+}
+print(json.dumps(cfg))
 PY
 )"
 write_meta_json "${OUTDIR}" "${MODE}" "${IMG}" "${CONFIG_JSON}"
@@ -116,7 +128,7 @@ for _ in $(seq 1 40); do
 done
 [ "${ready}" -eq 1 ] || die "TLS server not ready"
 
-# Warmup (inside container loop, no per-sample docker exec)
+# Warmup
 for _ in $(seq 1 "${WARMUP}"); do
   docker exec "client-${RUN_ID}" sh -lc "
     OPENSSL=/opt/openssl/bin/openssl
@@ -128,22 +140,10 @@ for _ in $(seq 1 "${WARMUP}"); do
   " >/dev/null 2>&1 || true
 done
 
-pct_py='
-import math
-def pct(vals,p):
-    vals=sorted(vals)
-    if not vals: return float("nan")
-    k=(len(vals)-1)*p/100.0
-    f=int(math.floor(k)); c=int(math.ceil(k))
-    if f==c: return vals[f]
-    return vals[f]*(c-k)+vals[c]*(k-f)
-'
-
 for r in $(seq 1 "${REPEATS}"); do
   rawfile="${rawdir}/rep${r}.txt"
   info "RUN rep=${r}/${REPEATS}"
 
-  # One docker exec for N samples; measure inside container; output: "idx,lat_ms,ok"
   docker exec "client-${RUN_ID}" sh -lc "
     set -e
     OPENSSL=/opt/openssl/bin/openssl
@@ -152,56 +152,35 @@ for r in $(seq 1 "${REPEATS}"); do
     GROUPS_ARG=''
     if [ -n '${TLS_GROUPS}' ]; then GROUPS_ARG=\"-groups ${TLS_GROUPS}\"; fi
 
-    # prefer python3 inside container if available for robust timing
-    if command -v python3 >/dev/null 2>&1; then
-      python3 - <<'PY'
+    python3 - <<'PY'
 import os, subprocess, time, sys
-N=int(os.environ["N"])
-TO=float(os.environ["TO"])
-PORT=os.environ["PORT"]
-extra=os.environ.get("EXTRA","")
-providers=os.environ.get("PROVIDERS","")
-groups=os.environ.get("GROUPS","")
+N=int(os.environ['N'])
+TO=float(os.environ['TO'])
+PORT=os.environ['PORT']
+providers=os.environ.get('PROVIDERS','')
+groups=os.environ.get('GROUPS','')
+extra=os.environ.get('EXTRA','')
 
-cmd_base=f'''OPENSSL=/opt/openssl/bin/openssl
+cmd=f'''OPENSSL=/opt/openssl/bin/openssl
 [ -x \"$OPENSSL\" ] || OPENSSL=\"$(command -v openssl || true)\"
 timeout {TO}s \"$OPENSSL\" s_client -connect {PORT} -tls1_3 -brief {providers} {groups} {extra} </dev/null >/dev/null 2>&1
 '''.strip()
 
-def run_one():
+for i in range(1, N+1):
     t0=time.perf_counter_ns()
-    rc=subprocess.call(["sh","-lc",cmd_base])
+    rc=subprocess.call(['sh','-lc',cmd])
     t1=time.perf_counter_ns()
-    return rc, (t1-t0)/1e6
-
-for i in range(1,N+1):
-    rc, ms = run_one()
-    ok = 1 if rc==0 else 0
+    ms=(t1-t0)/1e6
+    ok=1 if rc==0 else 0
     sys.stdout.write(f\"{i},{ms:.4f},{ok}\\n\")
 PY
-    else
-      # fallback: date +%s%N (best-effort)
-      i=1
-      while [ \$i -le ${N} ]; do
-        t0=\$(date +%s%N)
-        timeout ${ATTEMPT_TIMEOUT}s \"\$OPENSSL\" s_client -connect server-${RUN_ID}:${PORT} -tls1_3 -brief \${PROVIDERS} \${GROUPS_ARG} ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1
-        rc=\$?
-        t1=\$(date +%s%N)
-        # ms = (t1 - t0)/1e6
-        ms=\$(awk -v a=\"\$t0\" -v b=\"\$t1\" 'BEGIN{printf \"%.4f\", (b-a)/1000000.0}')
-        ok=0; [ \$rc -eq 0 ] && ok=1
-        echo \"\${i},\${ms},\${ok}\"
-        i=\$((i+1))
-      done
-    fi
   " \
   N="${N}" TO="${ATTEMPT_TIMEOUT}" PORT="server-${RUN_ID}:${PORT}" \
   PROVIDERS="${providers_args}" GROUPS="${TLS_GROUPS:+-groups ${TLS_GROUPS}}" EXTRA="${TLS_CLIENT_EXTRA_ARGS}" \
   | tee "${rawfile}" >/dev/null
 
-  # Append samples CSV and compute summary on host (no docker exec overhead in samples)
   python3 - <<PY
-import csv, math, statistics, sys
+import math, statistics
 
 raw_path=${rawfile!r}
 samples_csv=${samples_csv!r}
@@ -220,7 +199,7 @@ with open(raw_path,"r",encoding="utf-8") as f:
         if not line: continue
         i_s, ms_s, ok_s = line.split(",")
         i=int(i_s); ms=float(ms_s); ok_flag=int(ok_s)
-        with open(samples_csv,"a",encoding="utf-8",newline="") as out:
+        with open(samples_csv,"a",encoding="utf-8") as out:
             out.write(f"{rep},{mode},{N},{TO},{i},{ms:.4f},{ok_flag}\\n")
         if ok_flag==1:
             ok += 1
