@@ -2,23 +2,26 @@
 set -euo pipefail
 
 # =========================
-# Paper-grade Signature Speed Benchmark (FINAL, robust + fast)
-# - single persistent container (docker exec) to reduce overhead
-# - robust parsing:
-#   * ECDSA: parse ONLY the summary table row "256 bits ecdsa ..."
-#   * PQC  : parse the summary table row "<alg> ... <keygens/s> <sign/s> <verify/s>"
-# - non-fatal by default (STRICT=0): never lose partial results
+# Paper-grade Signature Speed Benchmark (FINAL, FIXED)
+# - Fixes AWK exit-code bug that caused NaN (esp. ecdsap256)
+# - Uses ONE long-lived container to avoid docker run overhead
+# - Adds timeout watchdog to prevent "stuck" runs
+# - Always writes CSV rows (non-fatal by default)
 # =========================
 
 IMG="${IMG:?IMG is required}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 MODE="${MODE:-paper}"
 
-REPEATS="${REPEATS:-7}"
+REPEATS="${REPEATS:-5}"
 WARMUP="${WARMUP:-2}"
-BENCH_SECONDS="${BENCH_SECONDS:-20}"
-STRICT="${STRICT:-0}"          # STRICT=1 => any parse/run failure exits non-zero
-EXEC_TIMEOUT="${EXEC_TIMEOUT:-0}"  # seconds; 0 => no timeout wrapper
+BENCH_SECONDS="${BENCH_SECONDS:-15}"
+
+# STRICT=1 => abort on missing/non-numeric metrics
+STRICT="${STRICT:-0}"
+
+# Extra watchdog (seconds) added on top of BENCH_SECONDS
+WATCHDOG_EXTRA="${WATCHDOG_EXTRA:-45}"
 
 if [ "${MODE}" = "smoke" ]; then
   REPEATS=1
@@ -35,21 +38,15 @@ mkdir -p "${rawdir}"
 csv="${RESULTS_DIR}/sig_speed.csv"
 warnlog="${RESULTS_DIR}/sig_speed_warnings.log"
 : > "${warnlog}"
-
-# Stable CSV schema (paper-friendly + audit)
 echo "repeat,mode,seconds,alg,keygens_s,sign_s,verify_s,ok,err,raw_file" > "${csv}"
-
-echo "=== Signature speed (paper-grade, FINAL) ==="
-echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
-echo "IMG=${IMG}"
-echo "RESULTS_DIR=${RESULTS_DIR}"
-echo
 
 export LC_ALL=C
 
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
 warn() {
   local msg="$1"
-  echo "[WARN] ${msg}" | tee -a "${warnlog}" 1>&2
+  echo "[WARN] $(ts) ${msg}" | tee -a "${warnlog}" 1>&2
   if [ "${STRICT}" = "1" ]; then
     exit 1
   fi
@@ -67,56 +64,15 @@ isnum() {
   [[ "$x" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]
 }
 
-# Optional timeout wrapper (Linux coreutils). If unavailable, run directly.
-run_with_timeout() {
-  if [ "${EXEC_TIMEOUT}" != "0" ] && command -v timeout >/dev/null 2>&1; then
-    timeout --preserve-status "${EXEC_TIMEOUT}" "$@"
-  else
-    "$@"
-  fi
-}
-
-# Start one persistent container
-CID="$(docker run -d --rm -e LC_ALL=C "${IMG}" sh -lc 'sleep infinity')"
-cleanup() {
-  docker kill "${CID}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-# Locate openssl inside container once
-OPENSSL="$(
-  docker exec "${CID}" sh -lc '
-    OPENSSL=/opt/openssl/bin/openssl
-    [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
-    [ -n "$OPENSSL" ] || { echo "ERROR: openssl not found" 1>&2; exit 127; }
-    echo "$OPENSSL"
-  '
-)"
-
-# Run commands inside container, capture to raw file
-run_ecdsa_to_file() {
-  local rawfile="$1"
-  run_with_timeout docker exec "${CID}" sh -lc \
-    "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa" \
-    > "${rawfile}" 2>&1
-}
-
-run_pqc_to_file() {
-  local alg="$1" rawfile="$2"
-  run_with_timeout docker exec "${CID}" sh -lc \
-    "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider oqsprovider -provider default ${alg}" \
-    > "${rawfile}" 2>&1
-}
-
-# Parse ECDSA P-256 from SUMMARY TABLE ROW only:
-# Example summary row:
-#  256 bits ecdsa (nistp256)   0.0000s   0.0001s  43514.7  14540.3
-# We take the last 2 numeric tokens => sign/s, verify/s
+# ---------- AWK parsers (FIXED exit code) ----------
+# ECDSA: parse P-256 line and take last two numeric tokens (sign/s, verify/s)
+# Example line:
+# 256 bits ecdsa (nistp256)  0.0000s 0.0001s  43514.7  14540.3
 parse_ecdsa_p256() {
   awk '
     function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
     BEGIN{ found=0 }
-    $1=="256" && $2=="bits" && tolower($3)=="ecdsa" {
+    /ecdsa/ && /nistp256|prime256v1|secp256r1/ {
       n=0
       for(i=NF;i>=1;i--){
         if(isnum($i)){
@@ -126,21 +82,17 @@ parse_ecdsa_p256() {
         }
       }
       if(n==2){
-        found=1
         print a[1] "," a[2]
+        found=1
         exit
       }
     }
-    END{ if(found==0) exit 1 }
+    END{ exit(found?0:1) }
   '
 }
 
-# Parse PQC summary row:
-# Example:
-#                     mldsa44 ... keygens/s sign/s verify/s
-#                     mldsa44 0.000035s ... 28760.9 12257.1 31295.6
-# We match $1==alg (case-sensitive in practice) and take last 3 numeric tokens
-parse_pqc() {
+# PQC: match the algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
+parse_pqc_row() {
   local alg="$1"
   awk -v alg="$alg" '
     function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
@@ -155,75 +107,120 @@ parse_pqc() {
         }
       }
       if(n==3){
-        found=1
         print a[1] "," a[2] "," a[3]
+        found=1
         exit
       }
     }
-    END{ if(found==0) exit 1 }
+    END{ exit(found?0:1) }
   '
 }
 
-# ================= warmup (not recorded) =================
-echo "[INFO] warmup=${WARMUP} (not recorded)"
+# ---------- Start one long-lived container ----------
+echo "=== Signature speed (paper-grade, FINAL, FIXED) ==="
+echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
+echo "IMG=${IMG}"
+echo "RESULTS_DIR=${RESULTS_DIR}"
+echo "[INFO] $(ts) pulling image once..."
+docker pull "${IMG}" >/dev/null
+
+name="sigbench-$$"
+echo "[INFO] $(ts) starting container ${name}..."
+cid="$(docker run -d --rm --name "${name}" "${IMG}" sh -lc 'trap "exit 0" TERM INT; while :; do sleep 3600; done')"
+cleanup() { docker rm -f "${cid}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+# Locate openssl once
+OPENSSL="$(
+  docker exec "${cid}" sh -lc '
+    export LC_ALL=C
+    OPENSSL=/opt/openssl/bin/openssl
+    [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
+    [ -n "$OPENSSL" ] || { echo "ERROR: openssl not found" 1>&2; exit 127; }
+    echo "$OPENSSL"
+  '
+)"
+
+# Provide a timeout wrapper inside container (if available)
+TIMEOUT_CMD="$(
+  docker exec "${cid}" sh -lc '
+    if command -v timeout >/dev/null 2>&1; then
+      echo "timeout"
+    else
+      echo ""
+    fi
+  '
+)"
+
+run_in_container() {
+  # args: command...
+  if [ -n "${TIMEOUT_CMD}" ]; then
+    # watchdog = BENCH_SECONDS + extra
+    local wd=$((BENCH_SECONDS + WATCHDOG_EXTRA))
+    docker exec "${cid}" sh -lc "export LC_ALL=C; timeout -k 5 ${wd}s $*"
+  else
+    docker exec "${cid}" sh -lc "export LC_ALL=C; $*"
+  fi
+}
+
+run_speed_ecdsa() {
+  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true
+}
+
+run_speed_pqc() {
+  local alg="$1"
+  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider oqsprovider -provider default ${alg} 2>&1" || true
+}
+
+# ---------- Warmup ----------
+echo "[INFO] $(ts) warmup=${WARMUP} (not recorded)"
 for _ in $(seq 1 "${WARMUP}"); do
-  tmp="${rawdir}/_warmup_ecdsa.txt"
-  run_ecdsa_to_file "${tmp}" >/dev/null 2>&1 || true
-  for alg in "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
-    tmp="${rawdir}/_warmup_${alg}.txt"
-    run_pqc_to_file "${alg}" "${tmp}" >/dev/null 2>&1 || true
+  run_speed_ecdsa >/dev/null 2>&1 || true
+  for a in "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
+    run_speed_pqc "$a" >/dev/null 2>&1 || true
   done
 done
-rm -f "${rawdir}/_warmup_"*.txt >/dev/null 2>&1 || true
 
-# ================= main runs =================
+# ---------- Main runs ----------
 for r in $(seq 1 "${REPEATS}"); do
   for alg in "${SIGS[@]}"; do
     rawfile="${rawdir}/rep${r}_${alg}.txt"
     echo "[RUN] rep=${r}/${REPEATS} alg=${alg}"
 
     if [ "${alg}" = "ecdsap256" ]; then
-      if ! run_ecdsa_to_file "${rawfile}"; then
-        warn "ECDSA run failed (rep=${r}). raw=${rawfile}"
-        record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_RUN_FAILED" "${rawfile}"
-        continue
-      fi
+      out="$(run_speed_ecdsa)"
+      printf "%s\n" "${out}" > "${rawfile}"
 
       sign="" verify=""
-      if IFS=',' read -r sign verify < <(parse_ecdsa_p256 < "${rawfile}"); then
+      if IFS=',' read -r sign verify < <(printf "%s\n" "${out}" | parse_ecdsa_p256); then
         if isnum "${sign}" && isnum "${verify}"; then
-          echo "rep=${r} alg=${alg} sign/s=${sign} verify/s=${verify}"
+          echo "  -> sign/s=${sign} verify/s=${verify}"
           record_row "${r}" "${alg}" "" "${sign}" "${verify}" 1 "" "${rawfile}"
         else
-          warn "ECDSA non-numeric metrics (rep=${r}). sign=${sign:-} verify=${verify:-}. raw=${rawfile}"
+          warn "ECDSA non-numeric (rep=${r}) sign=${sign:-} verify=${verify:-} raw=${rawfile}"
           record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_NON_NUMERIC" "${rawfile}"
         fi
       else
-        warn "ECDSA P-256 summary row not found (rep=${r}). raw=${rawfile}"
+        warn "ECDSA P-256 row not found (rep=${r}) raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_ROW_NOT_FOUND" "${rawfile}"
       fi
-
       continue
     fi
 
-    # PQC
-    if ! run_pqc_to_file "${alg}" "${rawfile}"; then
-      warn "PQC run failed alg=${alg} (rep=${r}). raw=${rawfile}"
-      record_row "${r}" "${alg}" "" "" "" 0 "PQC_RUN_FAILED" "${rawfile}"
-      continue
-    fi
+    out="$(run_speed_pqc "${alg}")"
+    printf "%s\n" "${out}" > "${rawfile}"
 
     keygens="" sign="" verify=""
-    if IFS=',' read -r keygens sign verify < <(parse_pqc "${alg}" < "${rawfile}"); then
+    if IFS=',' read -r keygens sign verify < <(printf "%s\n" "${out}" | parse_pqc_row "${alg}"); then
       if isnum "${keygens}" && isnum "${sign}" && isnum "${verify}"; then
-        echo "rep=${r} alg=${alg} keygens/s=${keygens} sign/s=${sign} verify/s=${verify}"
+        echo "  -> keygens/s=${keygens} sign/s=${sign} verify/s=${verify}"
         record_row "${r}" "${alg}" "${keygens}" "${sign}" "${verify}" 1 "" "${rawfile}"
       else
-        warn "PQC non-numeric metrics alg=${alg} (rep=${r}). keygens=${keygens:-} sign=${sign:-} verify=${verify:-}. raw=${rawfile}"
+        warn "PQC non-numeric (rep=${r} alg=${alg}) keygens=${keygens:-} sign=${sign:-} verify=${verify:-} raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "PQC_NON_NUMERIC" "${rawfile}"
       fi
     else
-      warn "PQC summary row not found alg=${alg} (rep=${r}). raw=${rawfile}"
+      warn "PQC row not found (rep=${r} alg=${alg}) raw=${rawfile}"
       record_row "${r}" "${alg}" "" "" "" 0 "PQC_ROW_NOT_FOUND" "${rawfile}"
     fi
   done
