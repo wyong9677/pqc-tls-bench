@@ -1,6 +1,34 @@
-- name: Make scripts executable
-  shell: bash
-  run: |
-    set -euo pipefail
-    chmod +x scripts/*_paper.sh
-    chmod +x scripts/*.py
+      - name: Run paper benchmark pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "[INFO] MODE=${MODE}"
+          echo "[INFO] IMG=${IMG}"
+          echo "[INFO] RESULTS_DIR=${RESULTS_DIR}"
+          echo "[INFO] RUN_ID=${RUN_ID}"
+          echo "[INFO] RUN_DIR=${RUN_DIR}"
+
+          export OUTDIR="${RUN_DIR}"
+
+          echo "[INFO] === env_info_paper ==="
+          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
+            bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
+
+          echo "[INFO] === bench_tls_paper ==="
+          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
+            bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
+
+          echo "[INFO] === bench_tls_latency_paper ==="
+          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
+            bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
+
+          echo "[INFO] === bench_sig_paper ==="
+          MODE="${MODE}" IMG="${IMG}" OUTDIR="${OUTDIR}" \
+            REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
+            bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
+
+          echo "[INFO] === summarize_results ==="
+          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
