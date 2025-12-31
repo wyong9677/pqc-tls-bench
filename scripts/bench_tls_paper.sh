@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
 need docker
@@ -17,7 +18,7 @@ TIMESEC="${TIMESEC:-20}"
 
 # TLS config (override per experiment)
 TLS_PROVIDERS="${TLS_PROVIDERS:-default}"          # e.g. "default" or "oqsprovider,default"
-TLS_GROUPS="${TLS_GROUPS:-}"                      # e.g. "X25519" or "p256_kyber768" etc (if supported)
+TLS_GROUPS="${TLS_GROUPS:-}"                      # e.g. "X25519" or "p256_kyber768" (if supported)
 TLS_CERT_KEYALG="${TLS_CERT_KEYALG:-ec_p256}"      # "ec_p256" OR "mldsa65" OR "falcon512" etc
 TLS_SERVER_EXTRA_ARGS="${TLS_SERVER_EXTRA_ARGS:-}" # optional extra s_server args
 TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS:-}" # optional extra s_time/s_client args
@@ -40,19 +41,30 @@ mkdir -p "${rawdir}"
 csv="${OUTDIR}/tls_throughput.csv"
 echo "repeat,mode,timesec,providers,groups,cert_keyalg,connections,user_sec,conn_user_sec,real_seconds,ok,raw_file" > "${csv}"
 
-CONFIG_JSON="$(python3 - <<PY
-import json
-print(json.dumps({
+# ---- FIX: generate CONFIG_JSON via env vars (no ${VAR!r}) ----
+CONFIG_JSON="$(
+  TLS_PROVIDERS="${TLS_PROVIDERS}" \
+  TLS_GROUPS="${TLS_GROUPS}" \
+  TLS_CERT_KEYALG="${TLS_CERT_KEYALG}" \
+  TLS_SERVER_EXTRA_ARGS="${TLS_SERVER_EXTRA_ARGS}" \
+  TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS}" \
+  REPEATS="${REPEATS}" \
+  WARMUP="${WARMUP}" \
+  TIMESEC="${TIMESEC}" \
+  python3 - <<'PY'
+import os, json
+cfg = {
   "benchmark": "tls_throughput_s_time",
-  "repeats": int(${REPEATS}),
-  "warmup": int(${WARMUP}),
-  "timesec": int(${TIMESEC}),
-  "providers": ${TLS_PROVIDERS!r},
-  "groups": ${TLS_GROUPS!r},
-  "cert_keyalg": ${TLS_CERT_KEYALG!r},
-  "server_extra_args": ${TLS_SERVER_EXTRA_ARGS!r},
-  "client_extra_args": ${TLS_CLIENT_EXTRA_ARGS!r},
-}))
+  "repeats": int(os.environ["REPEATS"]),
+  "warmup": int(os.environ["WARMUP"]),
+  "timesec": int(os.environ["TIMESEC"]),
+  "providers": os.environ.get("TLS_PROVIDERS",""),
+  "groups": os.environ.get("TLS_GROUPS",""),
+  "cert_keyalg": os.environ.get("TLS_CERT_KEYALG",""),
+  "server_extra_args": os.environ.get("TLS_SERVER_EXTRA_ARGS",""),
+  "client_extra_args": os.environ.get("TLS_CLIENT_EXTRA_ARGS",""),
+}
+print(json.dumps(cfg))
 PY
 )"
 write_meta_json "${OUTDIR}" "${MODE}" "${IMG}" "${CONFIG_JSON}"
@@ -79,12 +91,10 @@ docker run -d --rm --name "server-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc 
     \"\$OPENSSL\" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
       -keyout /tmp/key.pem -out /tmp/cert.pem -subj \"/CN=localhost\" -days 1 \${PROVIDERS} >/dev/null 2>&1
   else
-    # PQ signature keys
     \"\$OPENSSL\" req -x509 -newkey '${TLS_CERT_KEYALG}' -nodes \
       -keyout /tmp/key.pem -out /tmp/cert.pem -subj \"/CN=localhost\" -days 1 \${PROVIDERS} >/dev/null 2>&1
   fi
 
-  # TLS groups (best-effort): pass only if set
   GROUPS_ARG=''
   if [ -n '${TLS_GROUPS}' ]; then
     GROUPS_ARG=\"-groups ${TLS_GROUPS}\"
@@ -111,7 +121,6 @@ for _ in $(seq 1 40); do
   fi
   sleep 0.2
 done
-
 if [ "${ready}" -ne 1 ]; then
   die "TLS server not ready (check docker logs server-${RUN_ID})"
 fi
