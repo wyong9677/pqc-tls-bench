@@ -42,6 +42,50 @@ jobs:
           DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG_BASE}")"
           echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
           echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
+name: pqc-bench-paper
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke=quick; paper=publication-grade"
+        required: true
+        default: "paper"
+        type: choice
+        options: ["smoke", "paper"]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      IMG_BASE: openquantumsafe/oqs-ossl3:latest
+      RESULTS_DIR: results
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare dirs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULTS_DIR}"
+
+      - name: Pull image and lock digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "${IMG_BASE}"
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG_BASE}")"
+          echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
+          echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
 
       - name: Compute RUN_ID and mode-specific knobs
         shell: bash
@@ -84,7 +128,7 @@ jobs:
           chmod +x scripts/*.sh
           chmod +x scripts/*.py || true
 
-      - name: Shell syntax check
+      - name: Shell syntax check (host)
         shell: bash
         run: |
           set -euo pipefail
@@ -93,34 +137,47 @@ jobs:
           bash -n scripts/bench_tls_paper.sh
           bash -n scripts/bench_tls_latency_paper.sh
           bash -n scripts/bench_sig_paper.sh
+          bash -n scripts/smoke_sig.sh
 
       - name: Verify latency script has no container-side python3
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== scripts/bench_tls_latency_paper.sh (head) ==="
-          sed -n '1,260p' scripts/bench_tls_latency_paper.sh
-
-          echo "=== check container-side python3 usage (robust) ==="
-          # 只要 python3 出现在 docker exec/run 的同一行附近，就视为容器内 python（禁止）
-          if awk '
-            /docker (exec|run)/ {
-              line=$0
-              if (index(line,"python3")>0) { print NR ":" line; bad=1 }
-            }
-            END { exit bad?0:1 }
-          ' scripts/bench_tls_latency_paper.sh; then
-            echo "ERROR: Detected python3 on a docker exec/run line -> container-side python is not allowed for oqs-ossl3." >&2
+          if grep -nE 'docker (exec|run).*python3' scripts/bench_tls_latency_paper.sh; then
+            echo "ERROR: python3 detected on docker exec/run line (container-side python)." >&2
             exit 1
           fi
-
-          # 额外保险：如果出现明显的容器 payload 写法：sh -lc "... python3 ..."
           if grep -nE 'sh -lc .*python3' scripts/bench_tls_latency_paper.sh; then
-            echo "ERROR: Detected python3 embedded in sh -lc payload -> likely container-side python." >&2
+            echo "ERROR: python3 detected inside sh -lc payload (container-side python)." >&2
             exit 1
           fi
-
           echo "OK: no container-side python3 detected."
+
+      - name: Smoke gate in container (providers + ECDSA + ML-DSA-44)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMG}" sh -lc '
+            set -euo pipefail
+            OPENSSL=/opt/openssl/bin/openssl
+            [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl)"
+
+            $OPENSSL list -providers -provider oqsprovider -provider default
+
+            printf "hello\n" > msg.bin
+
+            $OPENSSL genpkey -provider default -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ecdsa.key
+            $OPENSSL pkey   -provider default -in ecdsa.key -pubout -out ecdsa.pub
+            $OPENSSL dgst   -provider default -sha256 -sign ecdsa.key -out ecdsa.sig msg.bin
+            $OPENSSL dgst   -provider default -sha256 -verify ecdsa.pub -signature ecdsa.sig msg.bin
+
+            $OPENSSL genpkey -provider oqsprovider -provider default -algorithm mldsa44 -out mldsa.key
+            $OPENSSL pkey   -provider oqsprovider -provider default -in mldsa.key -pubout -out mldsa.pub
+            $OPENSSL pkeyutl -provider oqsprovider -provider default -sign -inkey mldsa.key -in msg.bin -out mldsa.sig
+            $OPENSSL pkeyutl -provider oqsprovider -provider default -verify -pubin -inkey mldsa.pub -in msg.bin -sigfile mldsa.sig
+
+            echo "SMOKE_OK"
+          '
 
       - name: Env info
         shell: bash
@@ -168,3 +225,4 @@ jobs:
         with:
           name: pqc-paper-results
           path: results
+
