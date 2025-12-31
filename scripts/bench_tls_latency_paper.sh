@@ -46,7 +46,7 @@ mkdir -p "${rawdir}"
 echo "repeat,mode,n,timeout_s,sample_idx,lat_ms,ok" > "${samples_csv}"
 echo "repeat,mode,n,timeout_s,ok,fail,p50_ms,p95_ms,p99_ms,mean_ms,std_ms" > "${summary_csv}"
 
-# ---- FIX: generate CONFIG_JSON via env vars (no ${VAR!r}) ----
+# CONFIG_JSON via env vars (bash-safe)
 CONFIG_JSON="$(
   TLS_PROVIDERS="${TLS_PROVIDERS}" \
   TLS_GROUPS="${TLS_GROUPS}" \
@@ -82,7 +82,7 @@ info "providers=${TLS_PROVIDERS} groups=${TLS_GROUPS:-<default>} cert_keyalg=${T
 docker network rm "${NET}" >/dev/null 2>&1 || true
 docker network create "${NET}" >/dev/null
 
-# Start server
+# Start server container
 docker run -d --rm --name "server-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc "
   set -e
   OPENSSL=/opt/openssl/bin/openssl
@@ -111,7 +111,7 @@ docker run -d --rm --name "server-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc 
 # Start client container (idle)
 docker run -d --rm --name "client-${RUN_ID}" --network "${NET}" "${IMG}" sh -lc "sleep infinity" >/dev/null
 
-# Wait ready
+# Wait ready (still uses shell in container, but all $ are escaped inside the container string)
 ready=0
 for _ in $(seq 1 40); do
   if docker exec "client-${RUN_ID}" sh -lc "
@@ -128,57 +128,75 @@ for _ in $(seq 1 40); do
 done
 [ "${ready}" -eq 1 ] || die "TLS server not ready"
 
-# Warmup
-for _ in $(seq 1 "${WARMUP}"); do
-  docker exec "client-${RUN_ID}" sh -lc "
-    OPENSSL=/opt/openssl/bin/openssl
-    [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
-    PROVIDERS='${providers_args}'
-    GROUPS_ARG=''
-    if [ -n '${TLS_GROUPS}' ]; then GROUPS_ARG=\"-groups ${TLS_GROUPS}\"; fi
-    timeout ${ATTEMPT_TIMEOUT}s \"\$OPENSSL\" s_client -connect server-${RUN_ID}:${PORT} -tls1_3 -brief \${PROVIDERS} \${GROUPS_ARG} ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1
-  " >/dev/null 2>&1 || true
-done
+# Warmup (use python invocation as well to avoid per-try docker exec overhead)
+docker exec "client-${RUN_ID}" sh -lc "
+  python3 - <<'PY'
+import os, shlex, subprocess, time
+WARMUP=int(os.environ['WARMUP'])
+TO=float(os.environ['TO'])
+host=os.environ['HOST']
+providers=os.environ.get('PROVIDERS','')
+groups=os.environ.get('GROUPS','')
+extra=os.environ.get('EXTRA','')
 
+openssl_bin='/opt/openssl/bin/openssl'
+args=[openssl_bin,'s_client','-connect',host,'-tls1_3','-brief']
+args+=shlex.split(providers)
+args+=shlex.split(groups)
+args+=shlex.split(extra)
+
+for _ in range(WARMUP):
+    try:
+        subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TO)
+    except Exception:
+        pass
+PY
+" \
+WARMUP="${WARMUP}" TO="${ATTEMPT_TIMEOUT}" HOST="server-${RUN_ID}:${PORT}" \
+PROVIDERS="${providers_args}" GROUPS="${TLS_GROUPS:+-groups ${TLS_GROUPS}}" EXTRA="${TLS_CLIENT_EXTRA_ARGS}" \
+>/dev/null 2>&1 || true
+
+# Main reps: one docker exec per rep; python uses subprocess.run(list) => no $OPENSSL on host
 for r in $(seq 1 "${REPEATS}"); do
   rawfile="${rawdir}/rep${r}.txt"
   info "RUN rep=${r}/${REPEATS}"
 
   docker exec "client-${RUN_ID}" sh -lc "
-    set -e
-    OPENSSL=/opt/openssl/bin/openssl
-    [ -x \"\$OPENSSL\" ] || OPENSSL=\"\$(command -v openssl || true)\"
-    PROVIDERS='${providers_args}'
-    GROUPS_ARG=''
-    if [ -n '${TLS_GROUPS}' ]; then GROUPS_ARG=\"-groups ${TLS_GROUPS}\"; fi
-
     python3 - <<'PY'
-import os, subprocess, time, sys
+import os, shlex, subprocess, time, sys
+
 N=int(os.environ['N'])
 TO=float(os.environ['TO'])
-PORT=os.environ['PORT']
+host=os.environ['HOST']
 providers=os.environ.get('PROVIDERS','')
 groups=os.environ.get('GROUPS','')
 extra=os.environ.get('EXTRA','')
 
-cmd=f'''OPENSSL=/opt/openssl/bin/openssl
-[ -x \"$OPENSSL\" ] || OPENSSL=\"$(command -v openssl || true)\"
-timeout {TO}s \"$OPENSSL\" s_client -connect {PORT} -tls1_3 -brief {providers} {groups} {extra} </dev/null >/dev/null 2>&1
-'''.strip()
+openssl_bin='/opt/openssl/bin/openssl'
+args=[openssl_bin,'s_client','-connect',host,'-tls1_3','-brief']
+args+=shlex.split(providers)
+args+=shlex.split(groups)
+args+=shlex.split(extra)
 
 for i in range(1, N+1):
     t0=time.perf_counter_ns()
-    rc=subprocess.call(['sh','-lc',cmd])
+    ok=1
+    try:
+        r=subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TO)
+        if r.returncode != 0:
+            ok=0
+    except Exception:
+        ok=0
     t1=time.perf_counter_ns()
     ms=(t1-t0)/1e6
-    ok=1 if rc==0 else 0
     sys.stdout.write(f\"{i},{ms:.4f},{ok}\\n\")
 PY
   " \
-  N="${N}" TO="${ATTEMPT_TIMEOUT}" PORT="server-${RUN_ID}:${PORT}" \
+  N="${N}" TO="${ATTEMPT_TIMEOUT}" HOST="server-${RUN_ID}:${PORT}" \
   PROVIDERS="${providers_args}" GROUPS="${TLS_GROUPS:+-groups ${TLS_GROUPS}}" EXTRA="${TLS_CLIENT_EXTRA_ARGS}" \
   | tee "${rawfile}" >/dev/null
 
+  # Summarize rep on host and append to CSVs
   python3 - <<PY
 import math, statistics
 
