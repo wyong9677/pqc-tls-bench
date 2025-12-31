@@ -17,7 +17,6 @@ jobs:
 
     env:
       IMG_BASE: openquantumsafe/oqs-ossl3:latest
-      RESULTS_DIR: results
 
     steps:
       - name: Checkout
@@ -28,12 +27,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Prepare dirs
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "${RESULTS_DIR}"
-
       - name: Pull image and lock digest
         shell: bash
         run: |
@@ -41,87 +34,13 @@ jobs:
           docker pull "${IMG_BASE}"
           DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG_BASE}")"
           echo "IMG=${DIGEST}" >> "$GITHUB_ENV"
-          echo "${DIGEST}" | tee "${RESULTS_DIR}/image_digest.txt"
+          echo "${DIGEST}" | tee image_digest.txt
 
-      - name: Compute RUN_ID and mode-specific knobs
+      - name: Run all benchmarks (single entry)
         shell: bash
         run: |
           set -euo pipefail
-          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
-          SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
-          if [ -n "${SHA}" ]; then RUN_ID="${TS}_${SHA}"; else RUN_ID="${TS}"; fi
-
-          echo "RUN_ID=${RUN_ID}" >> "$GITHUB_ENV"
-          echo "RUN_DIR=${RESULTS_DIR}/${RUN_ID}" >> "$GITHUB_ENV"
-          mkdir -p "${RESULTS_DIR}/${RUN_ID}"
-
-          MODE="${{ inputs.mode }}"
-          echo "MODE=${MODE}" >> "$GITHUB_ENV"
-
-          if [ "${MODE}" = "smoke" ]; then
-            echo "REPEATS=2" >> "$GITHUB_ENV"
-            echo "WARMUP=1" >> "$GITHUB_ENV"
-            echo "TIMESEC=5" >> "$GITHUB_ENV"
-            echo "N=50" >> "$GITHUB_ENV"
-            echo "ATTEMPT_TIMEOUT=2" >> "$GITHUB_ENV"
-            echo "BENCH_SECONDS=5" >> "$GITHUB_ENV"
-            echo "STRICT=0" >> "$GITHUB_ENV"
-          else
-            echo "REPEATS=5" >> "$GITHUB_ENV"
-            echo "WARMUP=2" >> "$GITHUB_ENV"
-            echo "TIMESEC=15" >> "$GITHUB_ENV"
-            echo "N=200" >> "$GITHUB_ENV"
-            echo "ATTEMPT_TIMEOUT=3" >> "$GITHUB_ENV"
-            echo "BENCH_SECONDS=15" >> "$GITHUB_ENV"
-            echo "STRICT=1" >> "$GITHUB_ENV"
-          fi
-
-      - name: Make scripts executable
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x scripts/*.sh
-          chmod +x scripts/*.py || true
-
-      - name: Env info
-        shell: bash
-        run: |
-          set -euo pipefail
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
-            bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
-
-      - name: TLS throughput
-        shell: bash
-        run: |
-          set -euo pipefail
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
-            TLS_PROVIDERS="default" TLS_CERT_KEYALG="ec_p256" TLS_GROUPS="X25519" \
-            bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
-
-      - name: TLS latency
-        shell: bash
-        run: |
-          set -euo pipefail
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-            TLS_PROVIDERS="default" TLS_CERT_KEYALG="ec_p256" TLS_GROUPS="X25519" \
-            bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
-
-      - name: Signature benchmark
-        shell: bash
-        run: |
-          set -euo pipefail
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
-            REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" \
-            STRICT="${STRICT}" \
-            bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
-
-      - name: Summarize results
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
+          MODE="${{ inputs.mode }}" IMG="${IMG}" bash scripts/run_all.sh
 
       - name: Upload results
         if: always()
