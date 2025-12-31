@@ -27,7 +27,6 @@ RUN_ID="${RUN_ID:-$(default_run_id)}"
 OUTDIR="${RESULTS_DIR}/${RUN_ID}"
 mkdir -p "${OUTDIR}"
 
-# Algorithm set (override if desired)
 SIGS_DEFAULT=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
 SIGS=("${SIGS_DEFAULT[@]}")
 if [ -n "${SIGS_CSV:-}" ]; then
@@ -42,18 +41,23 @@ warnlog="${OUTDIR}/sig_speed_warnings.log"
 
 echo "repeat,mode,seconds,alg,keygens_s,sign_s,verify_s,ok,err,raw_file" > "${csv}"
 
-# Meta
-CONFIG_JSON="$(python3 - <<PY
-import json
-print(json.dumps({
+# ---- FIX: CONFIG_JSON via env vars (no ${VAR!r}) ----
+CONFIG_JSON="$(
+  REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" WATCHDOG_EXTRA="${WATCHDOG_EXTRA}" STRICT="${STRICT}" \
+  SIGS_CSV="$(IFS=','; echo "${SIGS[*]}")" \
+  python3 - <<'PY'
+import os, json
+algs = [a for a in os.environ.get("SIGS_CSV","").split(",") if a]
+cfg = {
   "benchmark": "sig_speed",
-  "repeats": int(${REPEATS}),
-  "warmup": int(${WARMUP}),
-  "seconds": int(${BENCH_SECONDS}),
-  "watchdog_extra": int(${WATCHDOG_EXTRA}),
-  "algs": ${SIGS[@]@Q},
-  "strict": int(${STRICT}),
-}))
+  "repeats": int(os.environ["REPEATS"]),
+  "warmup": int(os.environ["WARMUP"]),
+  "seconds": int(os.environ["BENCH_SECONDS"]),
+  "watchdog_extra": int(os.environ["WATCHDOG_EXTRA"]),
+  "strict": int(os.environ["STRICT"]),
+  "algs": algs,
+}
+print(json.dumps(cfg))
 PY
 )"
 write_meta_json "${OUTDIR}" "${MODE}" "${IMG}" "${CONFIG_JSON}"
@@ -118,9 +122,7 @@ run_speed() {
     providers="oqsprovider,default"
   fi
   args="$(providers_to_args "${providers}")"
-  # IMPORTANT:
-  # - ecdsap256 (NOT "ecdsa") to avoid running all curves and exploding runtime
-  # - alg name must be passed explicitly
+  # CRITICAL: use ecdsap256 (NOT ecdsa), avoid huge runtime
   run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} ${args} ${alg} 2>&1" || true
 }
 
@@ -141,8 +143,6 @@ for r in $(seq 1 "${REPEATS}"); do
     out="$(run_speed "${alg}")"
     printf "%s\n" "${out}" > "${rawfile}"
 
-    # Parse on host using stable parser
-    parsed=""
     if parsed="$(python3 "${SCRIPT_DIR}/parse_sig_speed.py" --alg "${alg}" --raw "${rawfile}" 2>/dev/null)"; then
       IFS=',' read -r keygens sign verify <<<"${parsed}"
       if [ "${alg}" = "ecdsap256" ]; then
@@ -153,7 +153,6 @@ for r in $(seq 1 "${REPEATS}"); do
         record_row "${r}" "${alg}" "${keygens}" "${sign}" "${verify}" 1 "" "${rawfile}"
       fi
     else
-      # Determine error category
       err="PARSE_FAILED"
       python3 "${SCRIPT_DIR}/parse_sig_speed.py" --alg "${alg}" --raw "${rawfile}" 1>/dev/null 2>"${OUTDIR}/_parse_err.tmp" || true
       if grep -q "ECDSA_ROW_NOT_FOUND" "${OUTDIR}/_parse_err.tmp" 2>/dev/null; then err="ECDSA_ROW_NOT_FOUND"; fi
