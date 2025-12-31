@@ -1,107 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=common.sh
-source "${SCRIPT_DIR}/common.sh"
+# =========================
+# Paper-grade Signature Speed Benchmark (Provider-safe)
+# - DOES NOT use `openssl speed` for PQC (unsupported for 3rd-party providers)
+# - Uses openssl genpkey + pkeyutl loops timed by timeout+trap
+# - One long-lived container to reduce overhead
+# - Writes CSV + raw logs; STRICT=1 fails on real execution errors
+# =========================
 
-need docker
-need python3
-
-IMG="${IMG:?IMG is required (e.g. openquantumsafe/oqs-ossl3@sha256:...)}"
+IMG="${IMG:?IMG is required}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 MODE="${MODE:-paper}"
 
 REPEATS="${REPEATS:-5}"
 WARMUP="${WARMUP:-2}"
 BENCH_SECONDS="${BENCH_SECONDS:-15}"
-WATCHDOG_EXTRA="${WATCHDOG_EXTRA:-20}"
+STRICT="${STRICT:-1}"
 
-# Paper mode should fail-fast by default
-STRICT="${STRICT:-}"
-if [ -z "${STRICT}" ]; then
-  if [ "${MODE}" = "paper" ]; then STRICT=1; else STRICT=0; fi
-fi
+# Optional: separate keygen timing window (defaults to BENCH_SECONDS)
+KEYGEN_SECONDS="${KEYGEN_SECONDS:-${BENCH_SECONDS}}"
 
-RUN_ID="${RUN_ID:-$(default_run_id)}"
-OUTDIR="${RESULTS_DIR}/${RUN_ID}"
-mkdir -p "${OUTDIR}"
-
-SIGS_DEFAULT=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
-SIGS=("${SIGS_DEFAULT[@]}")
-if [ -n "${SIGS_CSV:-}" ]; then
-  IFS=',' read -r -a SIGS <<<"${SIGS_CSV}"
-fi
-
-rawdir="${OUTDIR}/sig_speed_raw"
+mkdir -p "${RESULTS_DIR}"
+rawdir="${RESULTS_DIR}/sig_speed_raw"
 mkdir -p "${rawdir}"
-csv="${OUTDIR}/sig_speed.csv"
-warnlog="${OUTDIR}/sig_speed_warnings.log"
-: > "${warnlog}"
 
+csv="${RESULTS_DIR}/sig_speed.csv"
+warnlog="${RESULTS_DIR}/sig_speed_warnings.log"
+: > "${warnlog}"
 echo "repeat,mode,seconds,alg,keygens_s,sign_s,verify_s,ok,err,raw_file" > "${csv}"
 
-# ---- FIX: CONFIG_JSON via env vars (no ${VAR!r}) ----
-CONFIG_JSON="$(
-  REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" WATCHDOG_EXTRA="${WATCHDOG_EXTRA}" STRICT="${STRICT}" \
-  SIGS_CSV="$(IFS=','; echo "${SIGS[*]}")" \
-  python3 - <<'PY'
-import os, json
-algs = [a for a in os.environ.get("SIGS_CSV","").split(",") if a]
-cfg = {
-  "benchmark": "sig_speed",
-  "repeats": int(os.environ["REPEATS"]),
-  "warmup": int(os.environ["WARMUP"]),
-  "seconds": int(os.environ["BENCH_SECONDS"]),
-  "watchdog_extra": int(os.environ["WATCHDOG_EXTRA"]),
-  "strict": int(os.environ["STRICT"]),
-  "algs": algs,
-}
-print(json.dumps(cfg))
-PY
-)"
-write_meta_json "${OUTDIR}" "${MODE}" "${IMG}" "${CONFIG_JSON}"
+export LC_ALL=C
 
-info "Signature speed: mode=${MODE} run_id=${RUN_ID} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
-info "IMG=${IMG}"
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-info "Pulling image once..."
-docker pull "${IMG}" >/dev/null
-
-name="sigbench-${RUN_ID}"
-info "Starting long-lived container ${name}..."
-cid="$(docker run -d --rm --name "${name}" "${IMG}" sh -lc 'trap "exit 0" TERM INT; while :; do sleep 3600; done')"
-cleanup() { docker rm -f "${cid}" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-OPENSSL="$(
-  docker exec "${cid}" sh -lc '
-    OPENSSL=/opt/openssl/bin/openssl
-    [ -x "$OPENSSL" ] || OPENSSL="$(command -v openssl || true)"
-    [ -n "$OPENSSL" ] || { echo "ERROR: openssl not found" 1>&2; exit 127; }
-    echo "$OPENSSL"
-  '
-)"
-
-HAS_TIMEOUT="$(
-  docker exec "${cid}" sh -lc 'command -v timeout >/dev/null 2>&1 && echo 1 || echo 0'
-)"
-
-run_in_container() {
-  local cmd="$1"
-  if [ "${HAS_TIMEOUT}" = "1" ]; then
-    local wd=$((BENCH_SECONDS + WATCHDOG_EXTRA))
-    docker exec "${cid}" sh -lc "timeout -k 5 ${wd}s ${cmd}"
-  else
-    docker exec "${cid}" sh -lc "${cmd}"
-  fi
-}
-
-warnlog_append() {
+warn() {
   local msg="$1"
   echo "[WARN] $(ts) ${msg}" | tee -a "${warnlog}" 1>&2
   if [ "${STRICT}" = "1" ]; then
-    die "${msg}"
+    echo "[ERROR] $(ts) ${msg}" 1>&2
+    exit 1
   fi
 }
 
@@ -112,59 +50,197 @@ record_row() {
   echo "${r},${MODE},${BENCH_SECONDS},${alg},${keygens},${sign},${verify},${ok},\"${err}\",\"${raw}\"" >> "${csv}"
 }
 
-run_speed() {
-  local alg="$1"
-  local providers args
-  # ECDSA uses default provider only; PQC uses oqsprovider+default
-  if [ "${alg}" = "ecdsap256" ]; then
-    providers="default"
-  else
-    providers="oqsprovider,default"
-  fi
-  args="$(providers_to_args "${providers}")"
-  # CRITICAL: use ecdsap256 (NOT ecdsa), avoid huge runtime
-  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} ${args} ${alg} 2>&1" || true
+isnum() {
+  local x="${1:-}"
+  [[ "$x" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]
 }
 
-# Warmup
-info "Warmup=${WARMUP} (not recorded)"
+# ---------- Container lifecycle ----------
+RUN_ID="${RUN_ID:-$(date -u +'%Y%m%dT%H%M%SZ')}"
+cname="sigbench-${RUN_ID}"
+
+echo "[INFO] $(ts) Signature speed: mode=${MODE} run_id=${RUN_ID} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
+echo "[INFO] $(ts) IMG=${IMG}"
+echo "[INFO] $(ts) Pulling image once..."
+docker pull "${IMG}" >/dev/null 2>&1 || true
+
+cleanup() {
+  docker rm -f "${cname}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "[INFO] $(ts) Starting long-lived container ${cname}..."
+docker run -d --rm --name "${cname}" "${IMG}" sh -lc "sleep infinity" >/dev/null
+
+# Helper: exec a shell script in container via stdin (robust quoting)
+exec_in_container() {
+  docker exec -i "${cname}" sh -s
+}
+
+# ---------- Core benchmark primitive ----------
+# Runs a command in a tight loop for T seconds inside container; prints COUNT to stdout.
+# Uses timeout to send TERM; trap prints the counter on TERM.
+bench_count() {
+  local seconds="$1"
+  shift
+  local cmd="$*"
+
+  exec_in_container <<SH
+set -eu
+OPENSSL=/opt/openssl/bin/openssl
+[ -x "\$OPENSSL" ] || OPENSSL="\$(command -v openssl || true)"
+[ -n "\$OPENSSL" ] || { echo "NO_OPENSSL" >&2; exit 127; }
+
+# Ensure timeout exists
+command -v timeout >/dev/null 2>&1 || { echo "NO_TIMEOUT" >&2; exit 127; }
+
+T="${seconds}"
+
+# Loop with trap so timeout still yields count
+timeout -k 2 "\${T}" sh -c '
+  set -eu
+  c=0
+  trap "echo \$c; exit 0" TERM INT
+  while :; do
+    ${cmd} >/dev/null 2>&1
+    c=\$((c+1))
+  done
+'
+SH
+}
+
+# ---------- Algorithm-specific bench ----------
+# Outputs: "keygens_s,sign_s,verify_s" or returns nonzero on real errors
+bench_alg() {
+  local alg="$1"  # ecdsap256 | mldsa44 | mldsa65 | falcon512 | falcon1024
+
+  # Provider args & keygen recipe
+  local prov=""
+  local keygen=""
+  if [ "${alg}" = "ecdsap256" ]; then
+    prov="-provider default"
+    keygen='"\$OPENSSL" genpkey '"${prov}"' -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "\$KEY"'
+  else
+    prov="-provider oqsprovider -provider default"
+    keygen='"\$OPENSSL" genpkey '"${prov}"' -algorithm '"${alg}"' -out "\$KEY"'
+  fi
+
+  # Prepare workspace + message/key/pub inside container (one-time per call)
+  # Then run 3 benchmarks: keygen, sign, verify (using pkeyutl)
+  exec_in_container <<SH
+set -eu
+OPENSSL=/opt/openssl/bin/openssl
+[ -x "\$OPENSSL" ] || OPENSSL="\$(command -v openssl || true)"
+[ -n "\$OPENSSL" ] || { echo "NO_OPENSSL" >&2; exit 127; }
+
+command -v timeout >/dev/null 2>&1 || { echo "NO_TIMEOUT" >&2; exit 127; }
+
+ALG="${alg}"
+PROV='${prov}'
+T_SIGN="${BENCH_SECONDS}"
+T_KEYGEN="${KEYGEN_SECONDS}"
+
+WORK="/tmp/sigbench"
+mkdir -p "\$WORK"
+KEY="\$WORK/key.pem"
+PUB="\$WORK/pub.pem"
+MSG="\$WORK/msg.bin"
+SIG="\$WORK/sig.bin"
+
+# stable message
+printf "pqc-bench-paper" > "\$MSG"
+
+# generate one key for sign/verify
+${keygen} >/dev/null 2>&1 || { echo "KEYGEN_FAILED" >&2; exit 2; }
+
+# pubkey
+"\$OPENSSL" pkey \${PROV} -in "\$KEY" -pubout -out "\$PUB" >/dev/null 2>&1 || { echo "PUBOUT_FAILED" >&2; exit 3; }
+
+# make one signature to ensure verify path works
+"\$OPENSSL" pkeyutl \${PROV} -sign -inkey "\$KEY" -in "\$MSG" -out "\$SIG" >/dev/null 2>&1 || { echo "SIGN_SETUP_FAILED" >&2; exit 4; }
+"\$OPENSSL" pkeyutl \${PROV} -verify -pubin -inkey "\$PUB" -in "\$MSG" -sigfile "\$SIG" >/dev/null 2>&1 || { echo "VERIFY_SETUP_FAILED" >&2; exit 5; }
+
+# Function: count loops for a given body command
+count_loop() {
+  local T="\$1"
+  shift
+  local BODY="\$*"
+  timeout -k 2 "\${T}" sh -c "
+    set -eu
+    c=0
+    trap 'echo \$c; exit 0' TERM INT
+    while :; do
+      \${BODY} >/dev/null 2>&1
+      c=\$((c+1))
+    done
+  "
+}
+
+# 1) keygen count (overwrite KEY each time)
+KEYGEN_COUNT="\$(count_loop "\${T_KEYGEN}" ${keygen} || true)"
+# 2) sign count (overwrite SIG)
+SIGN_COUNT="\$(count_loop "\${T_SIGN}" "\"\$OPENSSL\" pkeyutl \${PROV} -sign -inkey \"\$KEY\" -in \"\$MSG\" -out \"\$SIG\"" || true)"
+# 3) verify count
+VERIFY_COUNT="\$(count_loop "\${T_SIGN}" "\"\$OPENSSL\" pkeyutl \${PROV} -verify -pubin -inkey \"\$PUB\" -in \"\$MSG\" -sigfile \"\$SIG\"" || true)"
+
+# Validate numeric
+case "\$KEYGEN_COUNT" in (*[!0-9]*|"") echo "KEYGEN_COUNT_BAD:\$KEYGEN_COUNT" >&2; exit 10;; esac
+case "\$SIGN_COUNT" in (*[!0-9]*|"") echo "SIGN_COUNT_BAD:\$SIGN_COUNT" >&2; exit 11;; esac
+case "\$VERIFY_COUNT" in (*[!0-9]*|"") echo "VERIFY_COUNT_BAD:\$VERIFY_COUNT" >&2; exit 12;; esac
+
+# Print counts only; host computes /s precisely
+echo "\$KEYGEN_COUNT,\$SIGN_COUNT,\$VERIFY_COUNT"
+SH
+}
+
+rate() {
+  # args: count seconds -> prints rate with 1 decimal
+  local count="$1" secs="$2"
+  awk -v c="${count}" -v t="${secs}" 'BEGIN{ if(t<=0){print "nan"; exit} printf "%.1f", (c/t) }'
+}
+
+# ---------- Warmup ----------
+echo "[INFO] $(ts) Warmup=${WARMUP} (not recorded)"
 for _ in $(seq 1 "${WARMUP}"); do
-  for alg in "${SIGS[@]}"; do
-    run_speed "${alg}" >/dev/null 2>&1 || true
+  bench_alg "ecdsap256" >/dev/null 2>&1 || true
+  for a in "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
+    bench_alg "$a" >/dev/null 2>&1 || true
   done
 done
 
-# Main
+# ---------- Main benchmark ----------
 for r in $(seq 1 "${REPEATS}"); do
-  for alg in "${SIGS[@]}"; do
+  for alg in "ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
     rawfile="${rawdir}/rep${r}_${alg}.txt"
-    info "RUN rep=${r}/${REPEATS} alg=${alg}"
+    echo "[INFO] $(ts) RUN rep=${r}/${REPEATS} alg=${alg}"
 
-    out="$(run_speed "${alg}")"
+    out=""
+    if ! out="$(bench_alg "${alg}" 2>&1)"; then
+      printf "%s\n" "${out}" > "${rawfile}"
+      warn "SIG_BENCH_FAILED rep=${r} alg=${alg} raw=${rawfile} out=$(printf "%s" "${out}" | head -c 200)"
+      record_row "${r}" "${alg}" "" "" "" 0 "SIG_BENCH_FAILED" "${rawfile}"
+      continue
+    fi
+
     printf "%s\n" "${out}" > "${rawfile}"
 
-    if parsed="$(python3 "${SCRIPT_DIR}/parse_sig_speed.py" --alg "${alg}" --raw "${rawfile}" 2>/dev/null)"; then
-      IFS=',' read -r keygens sign verify <<<"${parsed}"
-      if [ "${alg}" = "ecdsap256" ]; then
-        echo "  -> sign/s=${sign} verify/s=${verify}"
-        record_row "${r}" "${alg}" "" "${sign}" "${verify}" 1 "" "${rawfile}"
-      else
-        echo "  -> keygens/s=${keygens} sign/s=${sign} verify/s=${verify}"
-        record_row "${r}" "${alg}" "${keygens}" "${sign}" "${verify}" 1 "" "${rawfile}"
-      fi
-    else
-      err="PARSE_FAILED"
-      python3 "${SCRIPT_DIR}/parse_sig_speed.py" --alg "${alg}" --raw "${rawfile}" 1>/dev/null 2>"${OUTDIR}/_parse_err.tmp" || true
-      if grep -q "ECDSA_ROW_NOT_FOUND" "${OUTDIR}/_parse_err.tmp" 2>/dev/null; then err="ECDSA_ROW_NOT_FOUND"; fi
-      if grep -q "PQC_ROW_NOT_FOUND" "${OUTDIR}/_parse_err.tmp" 2>/dev/null; then err="PQC_ROW_NOT_FOUND"; fi
-      warnlog_append "${err} rep=${r} alg=${alg} raw=${rawfile}"
-      record_row "${r}" "${alg}" "" "" "" 0 "${err}" "${rawfile}"
+    IFS=',' read -r keygen_cnt sign_cnt verify_cnt <<<"${out}" || true
+    if ! [[ "${keygen_cnt}" =~ ^[0-9]+$ && "${sign_cnt}" =~ ^[0-9]+$ && "${verify_cnt}" =~ ^[0-9]+$ ]]; then
+      warn "NON_NUMERIC_COUNTS rep=${r} alg=${alg} out=${out} raw=${rawfile}"
+      record_row "${r}" "${alg}" "" "" "" 0 "NON_NUMERIC_COUNTS" "${rawfile}"
+      continue
     fi
+
+    keygens_s="$(rate "${keygen_cnt}" "${KEYGEN_SECONDS}")"
+    sign_s="$(rate "${sign_cnt}" "${BENCH_SECONDS}")"
+    verify_s="$(rate "${verify_cnt}" "${BENCH_SECONDS}")"
+
+    echo "  -> keygens/s=${keygens_s} sign/s=${sign_s} verify/s=${verify_s}"
+    record_row "${r}" "${alg}" "${keygens_s}" "${sign_s}" "${verify_s}" 1 "" "${rawfile}"
   done
 done
 
 echo
-echo "OK. CSV: ${csv}"
+echo "CSV: ${csv}"
 echo "Raw: ${rawdir}/rep*_*.txt"
 echo "Warnings: ${warnlog}"
-echo "Meta: ${OUTDIR}/meta.json"
