@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =========================
-# Paper-grade Signature Speed Benchmark (FINAL, FIXED)
-# - Fixes AWK exit-code bug that caused NaN (esp. ecdsap256)
-# - Uses ONE long-lived container to avoid docker run overhead
-# - Adds timeout watchdog to prevent "stuck" runs
-# - Always writes CSV rows (non-fatal by default)
+# Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
+# - Robust ECDSA parser (OpenSSL-version agnostic)
+# - One long-lived container (no docker run overhead)
+# - Timeout watchdog to avoid stuck runs
+# - CSV always written; STRICT=1 enforces no silent nulls
 # =========================
 
 IMG="${IMG:?IMG is required}"
@@ -64,15 +64,17 @@ isnum() {
   [[ "$x" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]
 }
 
-# ---------- AWK parsers (FIXED exit code) ----------
-# ECDSA: parse P-256 line and take last two numeric tokens (sign/s, verify/s)
-# Example line:
-# 256 bits ecdsa (nistp256)  0.0000s 0.0001s  43514.7  14540.3
+# ---------- AWK parsers (FINAL, ROBUST) ----------
+
+# ECDSA: match any ECDSA result line with "bits" and take last two numeric tokens
+# This is stable across OpenSSL versions/providers.
 parse_ecdsa_p256() {
   awk '
-    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
+    function isnum(x){
+      return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
+    }
     BEGIN{ found=0 }
-    /ecdsa/ && /nistp256|prime256v1|secp256r1/ {
+    /ecdsa/ && /bits/ {
       n=0
       for(i=NF;i>=1;i--){
         if(isnum($i)){
@@ -91,11 +93,13 @@ parse_ecdsa_p256() {
   '
 }
 
-# PQC: match the algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
+# PQC: match the algorithm row and take last 3 numeric tokens
 parse_pqc_row() {
   local alg="$1"
   awk -v alg="$alg" '
-    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
+    function isnum(x){
+      return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
+    }
     BEGIN{ found=0 }
     $1==alg {
       n=0
@@ -117,7 +121,7 @@ parse_pqc_row() {
 }
 
 # ---------- Start one long-lived container ----------
-echo "=== Signature speed (paper-grade, FINAL, FIXED) ==="
+echo "=== Signature speed (paper-grade, FINAL, ROBUST) ==="
 echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
 echo "IMG=${IMG}"
 echo "RESULTS_DIR=${RESULTS_DIR}"
@@ -141,7 +145,7 @@ OPENSSL="$(
   '
 )"
 
-# Provide a timeout wrapper inside container (if available)
+# Provide timeout wrapper inside container (if available)
 TIMEOUT_CMD="$(
   docker exec "${cid}" sh -lc '
     if command -v timeout >/dev/null 2>&1; then
@@ -153,9 +157,7 @@ TIMEOUT_CMD="$(
 )"
 
 run_in_container() {
-  # args: command...
   if [ -n "${TIMEOUT_CMD}" ]; then
-    # watchdog = BENCH_SECONDS + extra
     local wd=$((BENCH_SECONDS + WATCHDOG_EXTRA))
     docker exec "${cid}" sh -lc "export LC_ALL=C; timeout -k 5 ${wd}s $*"
   else
@@ -201,7 +203,7 @@ for r in $(seq 1 "${REPEATS}"); do
           record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_NON_NUMERIC" "${rawfile}"
         fi
       else
-        warn "ECDSA P-256 row not found (rep=${r}) raw=${rawfile}"
+        warn "ECDSA row not found (rep=${r}) raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_ROW_NOT_FOUND" "${rawfile}"
       fi
       continue
