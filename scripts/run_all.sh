@@ -13,7 +13,7 @@ set -euo pipefail
 #   TLS_PROVIDERS, TLS_GROUPS, TLS_CERT_KEYALG, TLS_SERVER_EXTRA_ARGS, TLS_CLIENT_EXTRA_ARGS
 #   SIGS, MSG_BYTES
 
-ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+ts()  { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 info(){ echo "[INFO] $(ts) $*"; }
 warn(){ echo "[WARN] $(ts) $*" >&2; }
 die(){  echo "[ERROR] $(ts) $*" >&2; exit 1; }
@@ -29,18 +29,18 @@ RESULTS_DIR="${RESULTS_DIR:-results}"
 
 # If workflow didn’t precompute RUN_ID/RUN_DIR, compute here.
 if [ -z "${RUN_ID:-}" ]; then
-  TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+  TS_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
   SHA="$(git rev-parse --short HEAD 2>/dev/null || true)"
-  if [ -n "${SHA}" ]; then RUN_ID="${TS}_${SHA}"; else RUN_ID="${TS}"; fi
+  if [ -n "${SHA}" ]; then RUN_ID="${TS_ID}_${SHA}"; else RUN_ID="${TS_ID}"; fi
 fi
-RUN_DIR="${RUN_DIR:-${RESULTS_DIR}/${RUN_ID}}"
 
+RUN_DIR="${RUN_DIR:-${RESULTS_DIR}/${RUN_ID}}"
 mkdir -p "${RUN_DIR}"
 
-# Absolute path for docker bind mount
-RUN_DIR_ABS="$(python3 - <<PY
+# Absolute path for docker bind mount (ENV-safe; no ${VAR!r})
+RUN_DIR_ABS="$(RUN_DIR="${RUN_DIR}" python3 - <<'PY'
 import os
-print(os.path.abspath(${RUN_DIR!r}))
+print(os.path.abspath(os.environ["RUN_DIR"]))
 PY
 )"
 
@@ -71,16 +71,32 @@ TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS:-}"
 SIGS="${SIGS:-ecdsap256,mldsa44,mldsa65,falcon512,falcon1024}"
 MSG_BYTES="${MSG_BYTES:-32}"
 
-# Make sure scripts are executable on host (mount keeps mode, but do it anyway)
-chmod +x scripts/core/*.sh || true
-chmod +x scripts/*.py || true
+# Sanity: required core scripts must exist
+for f in \
+  scripts/core/env_info_core.sh \
+  scripts/core/tls_throughput_core.sh \
+  scripts/core/tls_latency_core.sh \
+  scripts/core/sig_bench_core.sh \
+  scripts/summarize_results.py
+do
+  [ -f "$f" ] || die "missing required file: $f"
+done
+
+# Ensure executable on host (best-effort)
+chmod +x scripts/core/*.sh >/dev/null 2>&1 || true
+chmod +x scripts/*.py >/dev/null 2>&1 || true
 
 # Pull image once (best-effort)
 docker pull "${IMG}" >/dev/null 2>&1 || true
 
-run_in_container() {
-  local name="$1"; shift
-  info "== container step: ${name} =="
+run_core_in_container() {
+  # args: <label> <core_script>
+  local label="$1"
+  local core="$2"
+
+  info "== container step: ${label} (${core}) =="
+
+  # Note: core scripts are POSIX sh; run with sh explicitly.
   docker run --rm \
     -v "${RUN_DIR_ABS}:/out" \
     -v "$(pwd):/work" \
@@ -100,24 +116,20 @@ run_in_container() {
     -e TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS}" \
     -e SIGS="${SIGS}" \
     -e MSG_BYTES="${MSG_BYTES}" \
-    "${IMG}" sh -lc "$*"
+    "${IMG}" sh -lc "set -eu; sh '${core}' /out"
 }
 
 # 1) container env info
-run_in_container "env_info_core" \
-  "sh scripts/core/env_info_core.sh /out | tee /out/env_info.txt >/dev/null"
+run_core_in_container "env_info_core" "scripts/core/env_info_core.sh"
 
 # 2) TLS throughput
-run_in_container "tls_throughput_core" \
-  "sh scripts/core/tls_throughput_core.sh /out | tee /out/tls_throughput.path >/dev/null"
+run_core_in_container "tls_throughput_core" "scripts/core/tls_throughput_core.sh"
 
 # 3) TLS latency
-run_in_container "tls_latency_core" \
-  "sh scripts/core/tls_latency_core.sh /out | tee /out/tls_latency_summary.path >/dev/null"
+run_core_in_container "tls_latency_core" "scripts/core/tls_latency_core.sh"
 
 # 4) Signature bench
-run_in_container "sig_bench_core" \
-  "sh scripts/core/sig_bench_core.sh /out | tee /out/sig_speed.path >/dev/null"
+run_core_in_container "sig_bench_core" "scripts/core/sig_bench_core.sh"
 
 # Host-side summarize
 info "== host step: summarize_results.py =="
