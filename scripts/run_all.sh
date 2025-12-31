@@ -1,16 +1,14 @@
+cd ~/pqc-tls-bench
+mkdir -p scripts
+
+cat > scripts/run_all.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------
-# Defaults / Required
-# -------------------------
 MODE="${MODE:-paper}"
 IMG="${IMG:?IMG is required (e.g. openquantumsafe/oqs-ossl3:latest)}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 
-# -------------------------
-# Helpers
-# -------------------------
 die() { echo "[FATAL] $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
@@ -21,10 +19,8 @@ need docker
 [ -f "scripts/core/env_info_core.sh" ] || die "Missing scripts/core/env_info_core.sh"
 [ -f "scripts/core/sig_bench_core.sh" ] || die "Missing scripts/core/sig_bench_core.sh"
 
-# Use absolute paths for stable docker mounts (CI-friendly)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR_ABS="${ROOT_DIR}/${RESULTS_DIR}"
-
 mkdir -p "${RESULTS_DIR_ABS}"
 
 TS="$(date -u +'%Y%m%dT%H%M%SZ')"
@@ -33,9 +29,6 @@ RUN_ID="${TS}${SHA:+_${SHA}}"
 RUN_DIR="${RESULTS_DIR_ABS}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
 
-# -------------------------
-# Knobs (time budget control)
-# -------------------------
 if [ "${MODE}" = "smoke" ]; then
   REPEATS="${REPEATS:-1}"
   WARMUP="${WARMUP:-1}"
@@ -60,9 +53,6 @@ echo "[INFO] ROOT_DIR=${ROOT_DIR}"
 echo "[INFO] RUN_DIR=${RUN_DIR}"
 echo "[INFO] REPEATS=${REPEATS} WARMUP=${WARMUP} TIMESEC=${TIMESEC} N=${N} ATTEMPT_TIMEOUT=${ATTEMPT_TIMEOUT} BENCH_SECONDS=${BENCH_SECONDS} STRICT=${STRICT}"
 
-# -------------------------
-# Build CONFIG_JSON (host-only, no jq dependency)
-# -------------------------
 CONFIG_JSON="$(
   REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" N="${N}" \
   ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
@@ -81,9 +71,6 @@ print(json.dumps(cfg))
 PY
 )"
 
-# -------------------------
-# write_meta.py (FIXED: use argparse flags)
-# -------------------------
 python3 "${ROOT_DIR}/scripts/write_meta.py" \
   --outdir "${RUN_DIR}" \
   --mode "${MODE}" \
@@ -92,11 +79,7 @@ python3 "${ROOT_DIR}/scripts/write_meta.py" \
   --config_json "${CONFIG_JSON}" \
   |& tee "${RUN_DIR}/write_meta.log"
 
-# -------------------------
-# Run containerized steps (container: sh only)
-# -------------------------
-# Note: oqs-ossl3 image may NOT contain bash; always use sh.
-
+# Container might not have bash -> sh only
 docker run --rm \
   -v "${ROOT_DIR}:/work:ro" -w /work \
   -v "${RUN_DIR}:/out" \
@@ -112,3 +95,6 @@ docker run --rm \
   |& tee "${RUN_DIR}/sig_bench.log"
 
 echo "[OK] RUN_DIR=${RUN_DIR}"
+SH
+
+chmod +x scripts/run_all.sh
