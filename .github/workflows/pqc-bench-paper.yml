@@ -84,21 +84,29 @@ jobs:
           chmod +x scripts/*.sh
           chmod +x scripts/*.py || true
 
-      # 关键：强制校验 latency 脚本是否仍含 python3（容器里没 python3 会必炸）
-      - name: Verify latency script is container-safe (no python3)
+      # 关键：只禁止“容器内 python3”，允许 host python3
+      - name: Verify latency script has no container-side python3
         shell: bash
         run: |
           set -euo pipefail
           echo "=== scripts/bench_tls_latency_paper.sh (head) ==="
           sed -n '1,260p' scripts/bench_tls_latency_paper.sh
 
-          echo "=== grep python3 in latency script ==="
-          if grep -n "python3" scripts/bench_tls_latency_paper.sh; then
-            echo "ERROR: bench_tls_latency_paper.sh contains 'python3'. oqs-ossl3 container typically does not include python3, so this will fail." >&2
-            echo "Fix: remove container-side python usage; keep Python only on host (Actions runner)." >&2
+          echo "=== check container-side python3 usage ==="
+          # 1) docker exec/run 直接带 python3 的情况
+          if grep -nE 'docker (exec|run)[^|;]*python3' scripts/bench_tls_latency_paper.sh; then
+            echo "ERROR: latency script invokes python3 inside container (docker exec/run payload)." >&2
+            echo "Fix: remove container-side python; keep python only on host." >&2
             exit 1
           fi
-          echo "OK: latency script does not contain python3."
+          # 2) sh -lc payload 内嵌 python3 的情况（即使没写在同一行 docker exec）
+          if grep -nE 'sh -lc ".*python3|sh -lc '\''.*python3' scripts/bench_tls_latency_paper.sh; then
+            echo "ERROR: latency script embeds python3 in container shell payload (sh -lc ... python3 ...)." >&2
+            echo "Fix: remove container-side python; keep python only on host." >&2
+            exit 1
+          fi
+
+          echo "OK: no container-side python3 detected."
 
       - name: Env info
         shell: bash
