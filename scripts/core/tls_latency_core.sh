@@ -1,5 +1,16 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
+
+# POSIX-safe TLS latency core
+# Usage: tls_latency_core.sh /out
+# Env:
+#   MODE, REPEATS, WARMUP, N, ATTEMPT_TIMEOUT
+#   TLS_PROVIDERS (comma-separated, default: default)
+#   TLS_GROUPS (default: X25519)
+#   TLS_CERT_KEYALG (default: ec_p256)
+#   TLS_SERVER_EXTRA_ARGS, TLS_CLIENT_EXTRA_ARGS (optional; simple tokens)
+# Output:
+#   tls_latency_samples.csv, tls_latency_summary.csv, tls_latency_raw/rep*.txt
 
 OUTDIR="${1:?usage: tls_latency_core.sh /out}"
 mkdir -p "${OUTDIR}"
@@ -16,15 +27,29 @@ TLS_CERT_KEYALG="${TLS_CERT_KEYALG:-ec_p256}"
 TLS_SERVER_EXTRA_ARGS="${TLS_SERVER_EXTRA_ARGS:-}"
 TLS_CLIENT_EXTRA_ARGS="${TLS_CLIENT_EXTRA_ARGS:-}"
 
-OPENSSL="/opt/openssl/bin/openssl"
-if [ ! -x "${OPENSSL}" ]; then OPENSSL="$(command -v openssl)"; fi
+PORT="${PORT:-4433}"
 
-providers_args=()
-IFS=',' read -r -a _p <<< "${TLS_PROVIDERS}"
-for p in "${_p[@]}"; do
-  p="$(echo "$p" | xargs)"
-  [ -n "$p" ] && providers_args+=(-provider "$p")
-done
+OPENSSL="/opt/openssl/bin/openssl"
+if [ ! -x "${OPENSSL}" ]; then
+  OPENSSL="$(command -v openssl 2>/dev/null || true)"
+fi
+if [ -z "${OPENSSL}" ] || [ ! -x "${OPENSSL}" ]; then
+  echo "ERROR: openssl not found" >&2
+  exit 127
+fi
+
+# temp dir
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t tlsbench)"
+cleanup() {
+  if [ -f "${tmp}/server.pid" ]; then
+    pid="$(cat "${tmp}/server.pid" 2>/dev/null || true)"
+    if [ -n "${pid}" ]; then
+      kill "${pid}" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf "${tmp}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
 
 samples_csv="${OUTDIR}/tls_latency_samples.csv"
 summary_csv="${OUTDIR}/tls_latency_summary.csv"
@@ -34,50 +59,76 @@ mkdir -p "${rawdir}"
 echo "repeat,mode,n,timeout_s,sample_idx,lat_ms,ok" > "${samples_csv}"
 echo "repeat,mode,n,timeout_s,ok,fail,p50_ms,p95_ms,p99_ms,mean_ms,std_ms" > "${summary_csv}"
 
-PORT=4433
-tmp="$(mktemp -d)"
-trap 'rm -rf "${tmp}"' EXIT
+# ----- build args (POSIX: no arrays) -----
+build_provider_args() {
+  : > "${tmp}/prov.args"
+  echo "${TLS_PROVIDERS}" | awk -F',' '{
+    for (i=1;i<=NF;i++){
+      gsub(/^[ \t]+|[ \t]+$/,"",$i);
+      if ($i!="") print "-provider\n" $i
+    }
+  }' >> "${tmp}/prov.args"
+}
+
+build_groups_args() {
+  : > "${tmp}/grp.args"
+  if [ -n "${TLS_GROUPS}" ]; then
+    printf "%s\n%s\n" "-groups" "${TLS_GROUPS}" >> "${tmp}/grp.args"
+  fi
+}
 
 make_cert() {
+  set -- $(cat "${tmp}/prov.args" 2>/dev/null || true)
   if [ "${TLS_CERT_KEYALG}" = "ec_p256" ]; then
     "${OPENSSL}" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
       -keyout "${tmp}/key.pem" -out "${tmp}/cert.pem" -subj "/CN=localhost" -days 1 \
-      "${providers_args[@]}" >/dev/null 2>&1
+      "$@" >/dev/null 2>&1
   else
     "${OPENSSL}" req -x509 -newkey "${TLS_CERT_KEYALG}" -nodes \
       -keyout "${tmp}/key.pem" -out "${tmp}/cert.pem" -subj "/CN=localhost" -days 1 \
-      "${providers_args[@]}" >/dev/null 2>&1
+      "$@" >/dev/null 2>&1
   fi
 }
 
 start_server() {
-  local groups_arg=()
-  [ -n "${TLS_GROUPS}" ] && groups_arg=(-groups "${TLS_GROUPS}")
+  set -- $(cat "${tmp}/prov.args" 2>/dev/null || true) $(cat "${tmp}/grp.args" 2>/dev/null || true)
+  # TLS_SERVER_EXTRA_ARGS: best-effort simple tokens
+  # shellcheck disable=SC2086
   "${OPENSSL}" s_server -accept "${PORT}" -tls1_3 \
     -cert "${tmp}/cert.pem" -key "${tmp}/key.pem" \
-    "${providers_args[@]}" "${groups_arg[@]}" ${TLS_SERVER_EXTRA_ARGS} \
+    "$@" ${TLS_SERVER_EXTRA_ARGS} \
     -quiet >"${tmp}/server.log" 2>&1 &
   echo $! > "${tmp}/server.pid"
 }
 
-stop_server() {
-  if [ -f "${tmp}/server.pid" ]; then
-    kill "$(cat "${tmp}/server.pid")" >/dev/null 2>&1 || true
-  fi
+wait_server_ready() {
+  i=1
+  while [ $i -le 40 ]; do
+    set -- $(cat "${tmp}/prov.args" 2>/dev/null || true) $(cat "${tmp}/grp.args" 2>/dev/null || true)
+    # shellcheck disable=SC2086
+    if "${OPENSSL}" s_client -connect "127.0.0.1:${PORT}" -tls1_3 -brief \
+        "$@" ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i+1))
+    sleep 0.1
+  done
+  echo "ERROR: TLS server not ready; tail server.log:" >&2
+  tail -n 60 "${tmp}/server.log" 2>/dev/null >&2 || true
+  return 1
 }
 
 client_once() {
-  local groups_arg=()
-  [ -n "${TLS_GROUPS}" ] && groups_arg=(-groups "${TLS_GROUPS}")
+  set -- $(cat "${tmp}/prov.args" 2>/dev/null || true) $(cat "${tmp}/grp.args" 2>/dev/null || true)
+  # shellcheck disable=SC2086
   timeout "${ATTEMPT_TIMEOUT}s" \
     "${OPENSSL}" s_client -connect "127.0.0.1:${PORT}" -tls1_3 -brief \
-    "${providers_args[@]}" "${groups_arg[@]}" ${TLS_CLIENT_EXTRA_ARGS} \
-    </dev/null >/dev/null 2>&1
+    "$@" ${TLS_CLIENT_EXTRA_ARGS} </dev/null >/dev/null 2>&1
 }
 
 calc_stats() {
   # input: file with "i,ms,ok"
-  local f="$1"
+  f="$1"
   awk -F',' '
     $3==1 { vals[n++]=$2; sum+=$2; sumsq+=$2*$2; ok++ }
     $3!=1 { fail++ }
@@ -86,7 +137,7 @@ calc_stats() {
         printf "0,%d,na,na,na,na,na\n", fail
         exit
       }
-      # sort vals (simple)
+      # O(n^2) sort is fine for n<=200
       for(i=0;i<n;i++){
         for(j=i+1;j<n;j++){
           if(vals[j]<vals[i]){
@@ -106,34 +157,53 @@ calc_stats() {
   ' "$f"
 }
 
+# ----- main -----
+build_provider_args
+build_groups_args
+
 make_cert
 start_server
-sleep 0.3
+wait_server_ready
 
-# warmup
-for _ in $(seq 1 "${WARMUP}"); do
-  client_once || true
+# warmup (not recorded)
+w=1
+while [ $w -le "${WARMUP}" ]; do
+  client_once >/dev/null 2>&1 || true
+  w=$((w+1))
 done
 
-for r in $(seq 1 "${REPEATS}"); do
+r=1
+while [ $r -le "${REPEATS}" ]; do
   rawfile="${rawdir}/rep${r}.txt"
   echo "[INFO] rep=${r}/${REPEATS}"
   : > "${rawfile}"
 
-  for i in $(seq 1 "${N}"); do
+  i=1
+  while [ $i -le "${N}" ]; do
     t0="$(date +%s%N)"
     if client_once; then rc=0; else rc=$?; fi
     t1="$(date +%s%N)"
     ms="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.4f",(b-a)/1000000.0}')"
-    ok=0; [ "${rc}" -eq 0 ] && ok=1
+    ok=0
+    [ "${rc}" -eq 0 ] && ok=1
+
     echo "${i},${ms},${ok}" >> "${rawfile}"
     echo "${r},${MODE},${N},${ATTEMPT_TIMEOUT},${i},${ms},${ok}" >> "${samples_csv}"
+
+    i=$((i+1))
   done
 
   stats="$(calc_stats "${rawfile}")"
-  IFS=',' read -r ok fail p50 p95 p99 mean std <<< "${stats}"
+  ok="$(echo "${stats}" | awk -F',' '{print $1}')"
+  fail="$(echo "${stats}" | awk -F',' '{print $2}')"
+  p50="$(echo "${stats}" | awk -F',' '{print $3}')"
+  p95="$(echo "${stats}" | awk -F',' '{print $4}')"
+  p99="$(echo "${stats}" | awk -F',' '{print $5}')"
+  mean="$(echo "${stats}" | awk -F',' '{print $6}')"
+  std="$(echo "${stats}" | awk -F',' '{print $7}')"
+
   echo "${r},${MODE},${N},${ATTEMPT_TIMEOUT},${ok},${fail},${p50},${p95},${p99},${mean},${std}" >> "${summary_csv}"
+  r=$((r+1))
 done
 
-stop_server
 echo "${summary_csv}"
