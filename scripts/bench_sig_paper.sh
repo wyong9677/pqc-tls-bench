@@ -3,10 +3,12 @@ set -euo pipefail
 
 # =========================
 # Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
-# - ECDSA parser ONLY matches 256-bit / P-256 related rows to avoid 160/192-bit pollution
-# - Ensures P-256 is actually benchmarked by preferring "ecdsap256" when available
+# - ECDSA: always produces numeric sign/verify rates:
+#     * Prefer 256-bit if present
+#     * Else fallback to highest-bit pair (sign+verify) available
+#     * Record fallback bits in err field (ok=1)
 # - One long-lived container (no docker run overhead)
-# - Timeout watchdog to prevent "stuck" runs
+# - Timeout watchdog to avoid stuck runs
 # - CSV always written; STRICT=1 enforces no silent nulls
 # =========================
 
@@ -67,59 +69,80 @@ isnum() {
 
 # ---------- AWK parsers ----------
 
-# ECDSA: ONLY match 256-bit / P-256 related rows to prevent 160/192-bit pollution.
-# Acceptable matches:
-#   1) "Doing 256 bits sign ecdsa ..." or "Doing 256 bits verify ecdsa ..."
-#   2) summary rows containing "256 bits" and "ecdsa"
-#   3) rows mentioning P-256 aliases: nistp256 / prime256v1 / secp256r1
-# From the matched row, take the last two numeric tokens as sign/s, verify/s (summary)
-# OR for "Doing ..." lines, we compute rate from ops/N (handled by selecting summary if present).
-#
-# NOTE: In some OpenSSL builds, "speed ecdsa" does not emit a stable summary row.
-# This is why run_speed_ecdsa() prefers "ecdsap256" to force P-256 output.
-parse_ecdsa_p256() {
-  awk '
-    function isnum(x){
-      return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
-    }
+# ECDSA parser:
+# Robustly parse "Doing <bits> bits sign/verify ecdsa ops for Ns: OPS ..." lines.
+# - OPS is the numeric token immediately AFTER the "<Ns:>" token (not the trailing "256 bits ..." token)
+# Output: "sign_s,verify_s,bits_used"
+# Selection:
+#   - If 256-bit sign+verify present => use 256
+#   - Else use the highest bits where both sign and verify exist
+parse_ecdsa_rate() {
+  awk -v secs_default='"${BENCH_SECONDS}"' '
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
     BEGIN{
       IGNORECASE=1
-      found=0
-      sign_ops=""; verify_ops=""; secs=""
     }
 
-    # Capture seconds (best-effort) from "ops for 15s:" pattern
-    /ops[[:space:]]+for[[:space:]]+[0-9]+s:/ {
+    # Doing lines, capture ops count and seconds for each bits
+    /^Doing[[:space:]]+[0-9]+[[:space:]]+bits[[:space:]]+sign[[:space:]]+ecdsa/ {
+      bits=$2
+      s=""
+      ops=""
       for(i=1;i<=NF;i++){
         if($i ~ /^[0-9]+s:$/){
-          secs=$i
-          sub(/s:$/,"",secs)
+          s=$i; sub(/s:$/,"",s)
+          if(i+1<=NF && isnum($(i+1))) ops=$(i+1)
+          break
         }
       }
-    }
-
-    # Prefer parsing "Doing 256 bits sign/verify ..." lines to avoid any ambiguity.
-    /^Doing[[:space:]]+256[[:space:]]+bits[[:space:]]+sign[[:space:]]+ecdsa/ {
-      for(i=NF;i>=1;i--){
-        if(isnum($i)){ sign_ops=$i; break }
-      }
-      next
-    }
-    /^Doing[[:space:]]+256[[:space:]]+bits[[:space:]]+verify[[:space:]]+ecdsa/ {
-      for(i=NF;i>=1;i--){
-        if(isnum($i)){ verify_ops=$i; break }
+      if(ops!=""){
+        sign_ops[bits]=ops
+        sign_secs[bits]=(s!=""?s:secs_default)
       }
       next
     }
 
-    # If both ops captured and we know secs, compute rates and print.
-    # This is robust even when no summary table exists.
+    /^Doing[[:space:]]+[0-9]+[[:space:]]+bits[[:space:]]+verify[[:space:]]+ecdsa/ {
+      bits=$2
+      s=""
+      ops=""
+      for(i=1;i<=NF;i++){
+        if($i ~ /^[0-9]+s:$/){
+          s=$i; sub(/s:$/,"",s)
+          if(i+1<=NF && isnum($(i+1))) ops=$(i+1)
+          break
+        }
+      }
+      if(ops!=""){
+        verify_ops[bits]=ops
+        verify_secs[bits]=(s!=""?s:secs_default)
+      }
+      next
+    }
+
     END{
-      if(sign_ops!="" && verify_ops!=""){
-        s=(secs!=""?secs:15)   # fallback to 15 if not detected
-        printf "%.1f,%.1f\n", (sign_ops/s), (verify_ops/s)
+      # Prefer 256 if both exist
+      if( (256 in sign_ops) && (256 in verify_ops) ){
+        sign_s = sign_ops[256] / sign_secs[256]
+        verify_s = verify_ops[256] / verify_secs[256]
+        printf "%.1f,%.1f,256\n", sign_s, verify_s
         exit 0
       }
+
+      # Else highest bits where both exist
+      best=-1
+      for(b in sign_ops){
+        if( (b in verify_ops) && (b+0 > best) ){
+          best=b+0
+        }
+      }
+      if(best>=0){
+        sign_s = sign_ops[best] / sign_secs[best]
+        verify_s = verify_ops[best] / verify_secs[best]
+        printf "%.1f,%.1f,%d\n", sign_s, verify_s, best
+        exit 0
+      }
+
       exit 1
     }
   '
@@ -195,14 +218,9 @@ run_in_container() {
   fi
 }
 
-# Prefer forcing P-256 explicitly to guarantee 256-bit rows exist for parsing.
 run_speed_ecdsa() {
-  out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsap256 2>&1" || true)"
-  # If not supported, fall back to generic ecdsa (may fail STRICT if no 256-bit lines exist).
-  if printf "%s\n" "${out}" | grep -qiE "unknown|not supported|invalid command|No such|Error"; then
-    out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true)"
-  fi
-  printf "%s\n" "${out}"
+  # Keep your original command unchanged to match your setup
+  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true
 }
 
 run_speed_pqc() {
@@ -229,17 +247,22 @@ for r in $(seq 1 "${REPEATS}"); do
       out="$(run_speed_ecdsa)"
       printf "%s\n" "${out}" > "${rawfile}"
 
-      sign="" verify=""
-      if IFS=',' read -r sign verify < <(printf "%s\n" "${out}" | parse_ecdsa_p256); then
+      sign="" verify="" bits_used=""
+      if IFS=',' read -r sign verify bits_used < <(printf "%s\n" "${out}" | parse_ecdsa_rate); then
         if isnum "${sign}" && isnum "${verify}"; then
-          echo "  -> sign/s=${sign} verify/s=${verify}"
-          record_row "${r}" "${alg}" "" "${sign}" "${verify}" 1 "" "${rawfile}"
+          # Record a note if we had to fall back from 256
+          err=""
+          if [ "${bits_used}" != "256" ]; then
+            err="ECDSA_FALLBACK_BITS=${bits_used}"
+          fi
+          echo "  -> sign/s=${sign} verify/s=${verify} (bits=${bits_used})"
+          record_row "${r}" "${alg}" "" "${sign}" "${verify}" 1 "${err}" "${rawfile}"
         else
           warn "ECDSA non-numeric (rep=${r}) sign=${sign:-} verify=${verify:-} raw=${rawfile}"
           record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_NON_NUMERIC" "${rawfile}"
         fi
       else
-        warn "ECDSA P-256/256-bit lines not found (rep=${r}) raw=${rawfile}"
+        warn "ECDSA sign/verify ops not found (rep=${r}) raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_ROW_NOT_FOUND" "${rawfile}"
       fi
       continue
