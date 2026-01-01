@@ -75,17 +75,6 @@ jobs:
             echo "STRICT=1" >> "$GITHUB_ENV"
           fi
 
-      - name: Debug list scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== repo root ==="
-          ls -la
-          echo "=== scripts/ ==="
-          ls -la scripts || true
-          echo "=== scripts/core/ ==="
-          ls -la scripts/core || true
-
       - name: Make scripts executable (best-effort)
         shell: bash
         run: |
@@ -93,7 +82,6 @@ jobs:
           chmod +x scripts/*.sh 2>/dev/null || true
           chmod +x scripts/*.py 2>/dev/null || true
 
-      # Always use the "paper" scripts pipeline (known-good path).
       - name: Run paper pipeline (env/tls/sig + summarize)
         shell: bash
         run: |
@@ -101,9 +89,13 @@ jobs:
 
           echo "[INFO] MODE=${MODE}"
           echo "[INFO] IMG=${IMG}"
-          echo "[INFO] RESULTS_DIR=${RESULTS_DIR}"
+          echo "[INFO] RESULTS_DIR(root)=${RESULTS_DIR}"
           echo "[INFO] RUN_ID=${RUN_ID}"
           echo "[INFO] RUN_DIR=${RUN_DIR}"
+
+          # 关键：让所有 paper 脚本输出直接落在 RUN_DIR
+          OUT_DIR="${RUN_DIR}"
+          mkdir -p "${OUT_DIR}"
 
           for f in \
             scripts/env_info_paper.sh \
@@ -115,48 +107,42 @@ jobs:
             test -f "$f" || { echo "[ERROR] missing required file: $f" >&2; exit 1; }
           done
 
-          # 1) env info (writes results/env_info.txt by design)
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
-            bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
+          # 1) env info -> OUT_DIR
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${OUT_DIR}" RUN_ID="${RUN_ID}" \
+            bash scripts/env_info_paper.sh |& tee "${OUT_DIR}/env_info.log"
 
-          # Ensure env_info.txt exists under RUN_DIR for downstream verification
-          if [ -f "${RESULTS_DIR}/env_info.txt" ]; then
-            cp "${RESULTS_DIR}/env_info.txt" "${RUN_DIR}/env_info.txt"
-          else
-            echo "[ERROR] env_info_paper.sh did not produce ${RESULTS_DIR}/env_info.txt" >&2
-            exit 2
-          fi
-
-          # 2) TLS throughput
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+          # 2) TLS throughput -> OUT_DIR
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${OUT_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" TIMESEC="${TIMESEC}" \
-            bash scripts/bench_tls_paper.sh |& tee "${RUN_DIR}/tls_throughput.log"
+            bash scripts/bench_tls_paper.sh |& tee "${OUT_DIR}/tls_throughput.log"
 
-          # 3) TLS latency
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+          # 3) TLS latency -> OUT_DIR
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${OUT_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" N="${N}" ATTEMPT_TIMEOUT="${ATTEMPT_TIMEOUT}" \
-            bash scripts/bench_tls_latency_paper.sh |& tee "${RUN_DIR}/tls_latency.log"
+            bash scripts/bench_tls_latency_paper.sh |& tee "${OUT_DIR}/tls_latency.log"
 
-          # 4) Signature
-          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
+          # 4) Signature -> OUT_DIR
+          MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${OUT_DIR}" RUN_ID="${RUN_ID}" \
             REPEATS="${REPEATS}" WARMUP="${WARMUP}" BENCH_SECONDS="${BENCH_SECONDS}" STRICT="${STRICT}" \
-            bash scripts/bench_sig_paper.sh |& tee "${RUN_DIR}/sig_bench.log"
+            bash scripts/bench_sig_paper.sh |& tee "${OUT_DIR}/sig_bench.log"
 
-          # 5) summarize (host)
-          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${RUN_DIR}/summarize.log"
+          # 5) summarize (host) -> still point at RUN_DIR
+          python3 scripts/summarize_results.py "${RUN_DIR}" |& tee "${OUT_DIR}/summarize.log"
 
-          echo "[INFO] DONE. Outputs under: ${RUN_DIR}"
-          ls -la "${RUN_DIR}" || true
+          echo "[INFO] DONE. Outputs under: ${OUT_DIR}"
+          ls -la "${OUT_DIR}" || true
 
       - name: Verify outputs (fail fast on nonsense)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Safety: if env_info.txt was written to results/ root, bring it into RUN_DIR.
-          if [ ! -f "${RUN_DIR}/env_info.txt" ] && [ -f "${RESULTS_DIR}/env_info.txt" ]; then
-            cp "${RESULTS_DIR}/env_info.txt" "${RUN_DIR}/env_info.txt"
-          fi
+          # Safety fallback: if some legacy script still writes to results/ root, bring into RUN_DIR.
+          for f in env_info.txt tls_throughput.csv tls_latency_summary.csv tls_latency_samples.csv sig_speed.csv; do
+            if [ ! -f "${RUN_DIR}/${f}" ] && [ -f "${RESULTS_DIR}/${f}" ]; then
+              cp "${RESULTS_DIR}/${f}" "${RUN_DIR}/${f}"
+            fi
+          done
 
           cd "${RUN_DIR}"
 
