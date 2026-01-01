@@ -93,7 +93,7 @@ jobs:
           chmod +x scripts/*.sh 2>/dev/null || true
           chmod +x scripts/*.py 2>/dev/null || true
 
-      # 关键：始终使用 paper 脚本（你之前跑成功的那套），避免 run_all/core 依赖问题
+      # Always use the "paper" scripts pipeline (known-good path).
       - name: Run paper pipeline (env/tls/sig + summarize)
         shell: bash
         run: |
@@ -105,7 +105,6 @@ jobs:
           echo "[INFO] RUN_ID=${RUN_ID}"
           echo "[INFO] RUN_DIR=${RUN_DIR}"
 
-          # 强制要求这些脚本存在（这是你“之前执行成功”的那套）
           for f in \
             scripts/env_info_paper.sh \
             scripts/bench_tls_paper.sh \
@@ -116,9 +115,17 @@ jobs:
             test -f "$f" || { echo "[ERROR] missing required file: $f" >&2; exit 1; }
           done
 
-          # 1) env info
+          # 1) env info (writes results/env_info.txt by design)
           MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
             bash scripts/env_info_paper.sh |& tee "${RUN_DIR}/env_info.log"
+
+          # Ensure env_info.txt exists under RUN_DIR for downstream verification
+          if [ -f "${RESULTS_DIR}/env_info.txt" ]; then
+            cp "${RESULTS_DIR}/env_info.txt" "${RUN_DIR}/env_info.txt"
+          else
+            echo "[ERROR] env_info_paper.sh did not produce ${RESULTS_DIR}/env_info.txt" >&2
+            exit 2
+          fi
 
           # 2) TLS throughput
           MODE="${MODE}" IMG="${IMG}" RESULTS_DIR="${RESULTS_DIR}" RUN_ID="${RUN_ID}" \
@@ -145,6 +152,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Safety: if env_info.txt was written to results/ root, bring it into RUN_DIR.
+          if [ ! -f "${RUN_DIR}/env_info.txt" ] && [ -f "${RESULTS_DIR}/env_info.txt" ]; then
+            cp "${RESULTS_DIR}/env_info.txt" "${RUN_DIR}/env_info.txt"
+          fi
+
           cd "${RUN_DIR}"
 
           test -f env_info.txt || { echo "missing env_info.txt"; exit 2; }
@@ -152,12 +165,10 @@ jobs:
           test -f tls_throughput.csv || { echo "missing tls_throughput.csv"; exit 2; }
           lines="$(wc -l < tls_throughput.csv)"
           [ "${lines}" -ge 2 ] || { echo "bad tls_throughput.csv (too few lines)"; exit 2; }
-          # 至少一行 connections>0（否则就是你现在遇到的 connections=0 全零问题）
           awk -F',' 'NR>1 && $7+0>0 {ok=1} END{exit(ok?0:2)}' tls_throughput.csv \
             || { echo "bad tls_throughput.csv (all connections=0)"; exit 2; }
 
           test -f tls_latency_summary.csv || { echo "missing tls_latency_summary.csv"; exit 2; }
-          # p50(ms) 不应为 0 或 na
           awk -F',' 'NR==2 { if($7==0 || $7=="na") exit 2 }' tls_latency_summary.csv \
             || { echo "bad tls_latency_summary.csv (p50 is 0/na)"; exit 2; }
 
