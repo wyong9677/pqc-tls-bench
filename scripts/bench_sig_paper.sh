@@ -3,12 +3,13 @@ set -euo pipefail
 
 # =========================
 # Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
-# - ECDSA: always produces numeric sign/verify rates:
-#     * Prefer 256-bit if present
-#     * Else fallback to highest-bit pair (sign+verify) available
+# - ECDSA:
+#     * Prefer P-256 (ecdsap256) if supported; fallback to generic "ecdsa"
+#     * Parse ONLY "Doing <bits> bits sign/verify ecdsa ops for Ns: OPS" lines
+#     * Prefer 256-bit pair if present; else fallback to highest bits with sign+verify
 #     * Record fallback bits in err field (ok=1)
-# - One long-lived container (no docker run overhead)
-# - Timeout watchdog to avoid stuck runs
+# - Uses ONE long-lived container to avoid docker run overhead
+# - Adds timeout watchdog to prevent stuck runs
 # - CSV always written; STRICT=1 enforces no silent nulls
 # =========================
 
@@ -20,10 +21,7 @@ REPEATS="${REPEATS:-5}"
 WARMUP="${WARMUP:-2}"
 BENCH_SECONDS="${BENCH_SECONDS:-15}"
 
-# STRICT=1 => abort on missing/non-numeric metrics
 STRICT="${STRICT:-0}"
-
-# Extra watchdog (seconds) added on top of BENCH_SECONDS
 WATCHDOG_EXTRA="${WATCHDOG_EXTRA:-45}"
 
 if [ "${MODE}" = "smoke" ]; then
@@ -70,26 +68,22 @@ isnum() {
 # ---------- AWK parsers ----------
 
 # ECDSA parser:
-# Robustly parse "Doing <bits> bits sign/verify ecdsa ops for Ns: OPS ..." lines.
-# - OPS is the numeric token immediately AFTER the "<Ns:>" token (not the trailing "256 bits ..." token)
+# Parse "Doing <bits> bits sign/verify ecdsa ops for <Ns:> <OPS>" lines.
+# OPS is the numeric token immediately after "<Ns:>" token.
 # Output: "sign_s,verify_s,bits_used"
 # Selection:
 #   - If 256-bit sign+verify present => use 256
 #   - Else use the highest bits where both sign and verify exist
 parse_ecdsa_rate() {
-  awk -v secs_default='"${BENCH_SECONDS}"' '
+  awk -v secs_default="${BENCH_SECONDS}" '
     function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
-    BEGIN{
-      IGNORECASE=1
-    }
+    BEGIN{ IGNORECASE=1 }
 
-    # Doing lines, capture ops count and seconds for each bits
     /^Doing[[:space:]]+[0-9]+[[:space:]]+bits[[:space:]]+sign[[:space:]]+ecdsa/ {
       bits=$2
-      s=""
-      ops=""
+      s=""; ops=""
       for(i=1;i<=NF;i++){
-        if($i ~ /^[0-9]+s:$/){
+        if($i ~ /^[0-9.]+s:$/){
           s=$i; sub(/s:$/,"",s)
           if(i+1<=NF && isnum($(i+1))) ops=$(i+1)
           break
@@ -104,10 +98,9 @@ parse_ecdsa_rate() {
 
     /^Doing[[:space:]]+[0-9]+[[:space:]]+bits[[:space:]]+verify[[:space:]]+ecdsa/ {
       bits=$2
-      s=""
-      ops=""
+      s=""; ops=""
       for(i=1;i<=NF;i++){
-        if($i ~ /^[0-9]+s:$/){
+        if($i ~ /^[0-9.]+s:$/){
           s=$i; sub(/s:$/,"",s)
           if(i+1<=NF && isnum($(i+1))) ops=$(i+1)
           break
@@ -121,7 +114,6 @@ parse_ecdsa_rate() {
     }
 
     END{
-      # Prefer 256 if both exist
       if( (256 in sign_ops) && (256 in verify_ops) ){
         sign_s = sign_ops[256] / sign_secs[256]
         verify_s = verify_ops[256] / verify_secs[256]
@@ -129,12 +121,9 @@ parse_ecdsa_rate() {
         exit 0
       }
 
-      # Else highest bits where both exist
       best=-1
       for(b in sign_ops){
-        if( (b in verify_ops) && (b+0 > best) ){
-          best=b+0
-        }
+        if( (b in verify_ops) && (b+0 > best) ) best=b+0
       }
       if(best>=0){
         sign_s = sign_ops[best] / sign_secs[best]
@@ -148,7 +137,7 @@ parse_ecdsa_rate() {
   '
 }
 
-# PQC: match the algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
+# PQC: match algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
 parse_pqc_row() {
   local alg="$1"
   awk -v alg="$alg" '
@@ -187,7 +176,6 @@ cid="$(docker run -d --rm --name "${name}" "${IMG}" sh -lc 'trap "exit 0" TERM I
 cleanup() { docker rm -f "${cid}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-# Locate openssl once
 OPENSSL="$(
   docker exec "${cid}" sh -lc '
     export LC_ALL=C
@@ -198,7 +186,6 @@ OPENSSL="$(
   '
 )"
 
-# Provide timeout wrapper inside container (if available)
 TIMEOUT_CMD="$(
   docker exec "${cid}" sh -lc '
     if command -v timeout >/dev/null 2>&1; then
@@ -218,9 +205,13 @@ run_in_container() {
   fi
 }
 
+# Prefer P-256 specific benchmark if supported, else fallback to generic "ecdsa".
 run_speed_ecdsa() {
-  # Keep your original command unchanged to match your setup
-  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true
+  out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsap256 2>&1" || true)"
+  if printf "%s\n" "${out}" | grep -qiE "unknown|not supported|invalid|Error|No such"; then
+    out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true)"
+  fi
+  printf "%s\n" "${out}"
 }
 
 run_speed_pqc() {
@@ -250,7 +241,6 @@ for r in $(seq 1 "${REPEATS}"); do
       sign="" verify="" bits_used=""
       if IFS=',' read -r sign verify bits_used < <(printf "%s\n" "${out}" | parse_ecdsa_rate); then
         if isnum "${sign}" && isnum "${verify}"; then
-          # Record a note if we had to fall back from 256
           err=""
           if [ "${bits_used}" != "256" ]; then
             err="ECDSA_FALLBACK_BITS=${bits_used}"
