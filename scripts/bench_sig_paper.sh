@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =========================
 # Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
-# - Robust ECDSA parser (OpenSSL-version agnostic)
-# - One long-lived container (no docker run overhead)
-# - Timeout watchdog to avoid stuck runs
+# - Robust ECDSA parser: explicitly targets P-256/256-bit row to avoid "160 bits" token confusion
+# - One long-lived container to avoid docker run overhead
+# - Timeout watchdog to prevent "stuck" runs
 # - CSV always written; STRICT=1 enforces no silent nulls
 # =========================
 
@@ -64,17 +64,25 @@ isnum() {
   [[ "$x" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]
 }
 
-# ---------- AWK parsers (FINAL, ROBUST) ----------
+# ---------- AWK parsers (FINAL) ----------
 
-# ECDSA: match any ECDSA result line with "bits" and take last two numeric tokens
-# This is stable across OpenSSL versions/providers.
+# ECDSA:
+# OpenSSL "speed ecdsa" output is multi-row (160/192/256 bits etc.) and not machine-friendly.
+# We MUST avoid accidentally parsing "160" (bits) as a throughput value.
+# Strategy:
+#   - Prefer the "256 bits" ECDSA row, OR rows mentioning common P-256 aliases.
+#   - From that matched row, take the last two numeric tokens as (sign/s, verify/s).
 parse_ecdsa_p256() {
   awk '
     function isnum(x){
       return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
     }
     BEGIN{ found=0 }
-    /ecdsa/ && /bits/ {
+
+    # Prefer explicit 256-bit row (most robust)
+    (/ecdsa/ && /256[[:space:]]+bits/) \
+      || (/ecdsa/ && /nistp256|prime256v1|secp256r1/) {
+
       n=0
       for(i=NF;i>=1;i--){
         if(isnum($i)){
@@ -89,6 +97,7 @@ parse_ecdsa_p256() {
         exit
       }
     }
+
     END{ exit(found?0:1) }
   '
 }
@@ -121,7 +130,7 @@ parse_pqc_row() {
 }
 
 # ---------- Start one long-lived container ----------
-echo "=== Signature speed (paper-grade, FINAL, ROBUST) ==="
+echo "=== Signature speed (paper-grade, FINAL) ==="
 echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
 echo "IMG=${IMG}"
 echo "RESULTS_DIR=${RESULTS_DIR}"
@@ -203,7 +212,7 @@ for r in $(seq 1 "${REPEATS}"); do
           record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_NON_NUMERIC" "${rawfile}"
         fi
       else
-        warn "ECDSA row not found (rep=${r}) raw=${rawfile}"
+        warn "ECDSA P-256/256-bit row not found (rep=${r}) raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_ROW_NOT_FOUND" "${rawfile}"
       fi
       continue
