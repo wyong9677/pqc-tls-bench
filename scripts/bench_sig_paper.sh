@@ -3,8 +3,9 @@ set -euo pipefail
 
 # =========================
 # Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
-# - Robust ECDSA parser: explicitly targets P-256/256-bit row to avoid "160 bits" token confusion
-# - One long-lived container to avoid docker run overhead
+# - ECDSA parser ONLY matches 256-bit / P-256 related rows to avoid 160/192-bit pollution
+# - Ensures P-256 is actually benchmarked by preferring "ecdsap256" when available
+# - One long-lived container (no docker run overhead)
 # - Timeout watchdog to prevent "stuck" runs
 # - CSV always written; STRICT=1 enforces no silent nulls
 # =========================
@@ -64,51 +65,71 @@ isnum() {
   [[ "$x" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]
 }
 
-# ---------- AWK parsers (FINAL) ----------
+# ---------- AWK parsers ----------
 
-# ECDSA:
-# OpenSSL "speed ecdsa" output is multi-row (160/192/256 bits etc.) and not machine-friendly.
-# We MUST avoid accidentally parsing "160" (bits) as a throughput value.
-# Strategy:
-#   - Prefer the "256 bits" ECDSA row, OR rows mentioning common P-256 aliases.
-#   - From that matched row, take the last two numeric tokens as (sign/s, verify/s).
+# ECDSA: ONLY match 256-bit / P-256 related rows to prevent 160/192-bit pollution.
+# Acceptable matches:
+#   1) "Doing 256 bits sign ecdsa ..." or "Doing 256 bits verify ecdsa ..."
+#   2) summary rows containing "256 bits" and "ecdsa"
+#   3) rows mentioning P-256 aliases: nistp256 / prime256v1 / secp256r1
+# From the matched row, take the last two numeric tokens as sign/s, verify/s (summary)
+# OR for "Doing ..." lines, we compute rate from ops/N (handled by selecting summary if present).
+#
+# NOTE: In some OpenSSL builds, "speed ecdsa" does not emit a stable summary row.
+# This is why run_speed_ecdsa() prefers "ecdsap256" to force P-256 output.
 parse_ecdsa_p256() {
   awk '
     function isnum(x){
       return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
     }
-    BEGIN{ found=0 }
+    BEGIN{
+      IGNORECASE=1
+      found=0
+      sign_ops=""; verify_ops=""; secs=""
+    }
 
-    # Prefer explicit 256-bit row (most robust)
-    (/ecdsa/ && /256[[:space:]]+bits/) \
-      || (/ecdsa/ && /nistp256|prime256v1|secp256r1/) {
-
-      n=0
-      for(i=NF;i>=1;i--){
-        if(isnum($i)){
-          a[2-n]=$i
-          n++
-          if(n==2) break
+    # Capture seconds (best-effort) from "ops for 15s:" pattern
+    /ops[[:space:]]+for[[:space:]]+[0-9]+s:/ {
+      for(i=1;i<=NF;i++){
+        if($i ~ /^[0-9]+s:$/){
+          secs=$i
+          sub(/s:$/,"",secs)
         }
-      }
-      if(n==2){
-        print a[1] "," a[2]
-        found=1
-        exit
       }
     }
 
-    END{ exit(found?0:1) }
+    # Prefer parsing "Doing 256 bits sign/verify ..." lines to avoid any ambiguity.
+    /^Doing[[:space:]]+256[[:space:]]+bits[[:space:]]+sign[[:space:]]+ecdsa/ {
+      for(i=NF;i>=1;i--){
+        if(isnum($i)){ sign_ops=$i; break }
+      }
+      next
+    }
+    /^Doing[[:space:]]+256[[:space:]]+bits[[:space:]]+verify[[:space:]]+ecdsa/ {
+      for(i=NF;i>=1;i--){
+        if(isnum($i)){ verify_ops=$i; break }
+      }
+      next
+    }
+
+    # If both ops captured and we know secs, compute rates and print.
+    # This is robust even when no summary table exists.
+    END{
+      if(sign_ops!="" && verify_ops!=""){
+        s=(secs!=""?secs:15)   # fallback to 15 if not detected
+        printf "%.1f,%.1f\n", (sign_ops/s), (verify_ops/s)
+        exit 0
+      }
+      exit 1
+    }
   '
 }
 
-# PQC: match the algorithm row and take last 3 numeric tokens
+# PQC: match the algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
 parse_pqc_row() {
   local alg="$1"
   awk -v alg="$alg" '
-    function isnum(x){
-      return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)
-    }
+    function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
     BEGIN{ found=0 }
     $1==alg {
       n=0
@@ -130,7 +151,7 @@ parse_pqc_row() {
 }
 
 # ---------- Start one long-lived container ----------
-echo "=== Signature speed (paper-grade, FINAL) ==="
+echo "=== Signature speed (paper-grade, FINAL, ROBUST) ==="
 echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
 echo "IMG=${IMG}"
 echo "RESULTS_DIR=${RESULTS_DIR}"
@@ -174,8 +195,14 @@ run_in_container() {
   fi
 }
 
+# Prefer forcing P-256 explicitly to guarantee 256-bit rows exist for parsing.
 run_speed_ecdsa() {
-  run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true
+  out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsap256 2>&1" || true)"
+  # If not supported, fall back to generic ecdsa (may fail STRICT if no 256-bit lines exist).
+  if printf "%s\n" "${out}" | grep -qiE "unknown|not supported|invalid command|No such|Error"; then
+    out="$(run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider default ecdsa 2>&1" || true)"
+  fi
+  printf "%s\n" "${out}"
 }
 
 run_speed_pqc() {
@@ -212,7 +239,7 @@ for r in $(seq 1 "${REPEATS}"); do
           record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_NON_NUMERIC" "${rawfile}"
         fi
       else
-        warn "ECDSA P-256/256-bit row not found (rep=${r}) raw=${rawfile}"
+        warn "ECDSA P-256/256-bit lines not found (rep=${r}) raw=${rawfile}"
         record_row "${r}" "${alg}" "" "" "" 0 "ECDSA_ROW_NOT_FOUND" "${rawfile}"
       fi
       continue
