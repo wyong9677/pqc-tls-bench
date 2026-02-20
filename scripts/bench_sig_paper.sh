@@ -9,6 +9,10 @@ set -euo pipefail
 # 2) If an algorithm is unsupported / unknown, record ok=0 row and continue (no early abort).
 # 3) STRICT=1 now fails the job at the END if any ok=0 rows exist, instead of exiting on first warn.
 # 4) PQC parser is more tolerant (case-insensitive + prefix match).
+#
+# IMPORTANT CHANGE (2026-02-20):
+# - Use algorithm tokens that actually exist in openssl list output for this image,
+#   e.g. p256_mldsa44 / p384_mldsa65 / p521_mldsa87 instead of bare mldsa44/mldsa65.
 # =========================
 
 IMG="${IMG:?IMG is required}"
@@ -29,7 +33,19 @@ if [ "${MODE}" = "smoke" ]; then
 fi
 
 # Desired algorithms (targets). These will be filtered by "supported" list inside container.
-SIGS_DESIRED=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
+# Use HYBRID tokens that are present in your openssl_sigalgs.txt for oqsprovider.
+# (You can comment out items you don't want in the paper table.)
+SIGS_DESIRED=(
+  "ecdsap256"
+  "p256_mldsa44"
+  "p384_mldsa65"
+  "p521_mldsa87"
+  "p256_falcon512"
+  "p521_falcon1024"
+  # If you also want pure Falcon (non-hybrid) in the same table, uncomment:
+  # "falcon512"
+  # "falcon1024"
+)
 
 mkdir -p "${RESULTS_DIR}"
 rawdir="${RESULTS_DIR}/sig_speed_raw"
@@ -140,7 +156,6 @@ parse_ecdsa_rate() {
 
 # PQC parser:
 # Match algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s).
-# More tolerant than strict $1==alg:
 # - case-insensitive
 # - allow $1 starting with alg (prefix match)
 parse_pqc_row() {
@@ -236,20 +251,10 @@ echo "[INFO] $(ts) discovering supported signature algorithms (oqsprovider)..."
 sigalgs_out="$(run_in_container "\"${OPENSSL}\" list -signature-algorithms -provider oqsprovider -provider default 2>&1" || true)"
 printf "%s\n" "${sigalgs_out}" > "${supportlog}"
 
-# Build a lowercase set in a shell string for cheap membership test.
-# We store as " name1 name2 name3 " to allow substring-safe checks.
 supported_set=" "
-# Extract algorithm tokens from list output.
-# Typical formats:
-#   "mldsa44"
-#   "mldsa44 @ oqsprovider"
-#   "ECDSA"
-# We take the first field per non-empty line.
 while IFS= read -r line; do
-  # trim leading spaces
   l="${line#"${line%%[![:space:]]*}"}"
   [ -z "${l}" ] && continue
-  # ignore headers
   case "${l}" in
     *"Signature algorithms"*|*"Provided"*|*"providers"* ) continue ;;
   esac
@@ -274,7 +279,6 @@ for a in "${SIGS_DESIRED[@]}"; do
   if is_supported_sigalg "${a}"; then
     SIGS+=("${a}")
   else
-    # Not supported in this image/provider -> record a placeholder failure row for each repeat later
     echo "[INFO] $(ts) alg not supported in this image: ${a}"
   fi
 done
@@ -289,7 +293,6 @@ for _ in $(seq 1 "${WARMUP}"); do
   run_speed_ecdsa >/dev/null 2>&1 || true
   for a in "${SIGS_DESIRED[@]}"; do
     [ "${a}" = "ecdsap256" ] && continue
-    # Warmup only those supported, skip others
     if is_supported_sigalg "${a}"; then
       run_speed_pqc "$a" >/dev/null 2>&1 || true
     fi
@@ -298,7 +301,7 @@ done
 
 # ---------- Main runs ----------
 for r in $(seq 1 "${REPEATS}"); do
-  # First, record rows for unsupported algs (so CSV shape is stable across runs)
+  # record rows for unsupported algs (kept for robustness; with updated SIGS_DESIRED there should be none)
   for a in "${SIGS_DESIRED[@]}"; do
     [ "${a}" = "ecdsap256" ] && continue
     if ! is_supported_sigalg "${a}"; then
@@ -309,7 +312,6 @@ for r in $(seq 1 "${REPEATS}"); do
     fi
   done
 
-  # Then, benchmark supported algs + ecdsa
   for alg in "${SIGS[@]}"; do
     rawfile="${rawdir}/rep${r}_${alg}.txt"
     echo "[RUN] rep=${r}/${REPEATS} alg=${alg}"
@@ -341,7 +343,6 @@ for r in $(seq 1 "${REPEATS}"); do
     out="$(run_speed_pqc "${alg}")"
     printf "%s\n" "${out}" > "${rawfile}"
 
-    # If openssl says unknown algorithm despite list support, record it explicitly.
     if printf "%s\n" "${out}" | grep -qi "Unknown algorithm"; then
       warn "openssl speed: Unknown algorithm (rep=${r} alg=${alg}) raw=${rawfile}"
       record_row "${r}" "${alg}" "" "" "" 0 "UNKNOWN_ALGORITHM" "${rawfile}"
@@ -370,7 +371,6 @@ echo "Raw: ${rawdir}/rep*_*.txt"
 echo "Warnings: ${warnlog}"
 echo "Supported alg list: ${supportlog}"
 
-# STRICT behavior: fail at the end if any warnings/errors happened.
 if [ "${STRICT}" = "1" ] && [ "${HAD_ERROR}" = "1" ]; then
   echo "[ERROR] $(ts) STRICT=1: one or more algorithms failed/unsupported. See: ${warnlog}" 1>&2
   exit 1
