@@ -2,15 +2,13 @@
 set -euo pipefail
 
 # =========================
-# Paper-grade Signature Speed Benchmark (FINAL, ROBUST)
-# - ECDSA:
-#     * Prefer P-256 (ecdsap256) if supported; fallback to generic "ecdsa"
-#     * Parse ONLY "Doing <bits> bits sign/verify ecdsa ops for Ns: OPS" lines
-#     * Prefer 256-bit pair if present; else fallback to highest bits with sign+verify
-#     * Record fallback bits in err field (ok=1)
-# - Uses ONE long-lived container to avoid docker run overhead
-# - Adds timeout watchdog to prevent stuck runs
-# - CSV always written; STRICT=1 enforces no silent nulls
+# Paper-grade Signature Speed Benchmark (ROBUST)
+#
+# Fixes:
+# 1) Detect supported signature algorithms inside container (oqsprovider) before benchmarking.
+# 2) If an algorithm is unsupported / unknown, record ok=0 row and continue (no early abort).
+# 3) STRICT=1 now fails the job at the END if any ok=0 rows exist, instead of exiting on first warn.
+# 4) PQC parser is more tolerant (case-insensitive + prefix match).
 # =========================
 
 IMG="${IMG:?IMG is required}"
@@ -30,7 +28,8 @@ if [ "${MODE}" = "smoke" ]; then
   BENCH_SECONDS=5
 fi
 
-SIGS=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
+# Desired algorithms (targets). These will be filtered by "supported" list inside container.
+SIGS_DESIRED=("ecdsap256" "mldsa44" "mldsa65" "falcon512" "falcon1024")
 
 mkdir -p "${RESULTS_DIR}"
 rawdir="${RESULTS_DIR}/sig_speed_raw"
@@ -38,6 +37,8 @@ mkdir -p "${rawdir}"
 
 csv="${RESULTS_DIR}/sig_speed.csv"
 warnlog="${RESULTS_DIR}/sig_speed_warnings.log"
+supportlog="${rawdir}/openssl_sigalgs.txt"
+
 : > "${warnlog}"
 echo "repeat,mode,seconds,alg,keygens_s,sign_s,verify_s,ok,err,raw_file" > "${csv}"
 
@@ -45,12 +46,12 @@ export LC_ALL=C
 
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
+HAD_ERROR=0
+
 warn() {
   local msg="$1"
   echo "[WARN] $(ts) ${msg}" | tee -a "${warnlog}" 1>&2
-  if [ "${STRICT}" = "1" ]; then
-    exit 1
-  fi
+  HAD_ERROR=1
 }
 
 record_row() {
@@ -137,25 +138,36 @@ parse_ecdsa_rate() {
   '
 }
 
-# PQC: match algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s)
+# PQC parser:
+# Match algorithm row and take last 3 numeric tokens (keygens/s, sign/s, verify/s).
+# More tolerant than strict $1==alg:
+# - case-insensitive
+# - allow $1 starting with alg (prefix match)
 parse_pqc_row() {
   local alg="$1"
   awk -v alg="$alg" '
     function isnum(x){ return (x ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) }
-    BEGIN{ found=0 }
-    $1==alg {
-      n=0
-      for(i=NF;i>=1;i--){
-        if(isnum($i)){
-          a[3-n]=$i
-          n++
-          if(n==3) break
+    BEGIN{
+      found=0
+      IGNORECASE=1
+      alg_l=tolower(alg)
+    }
+    {
+      t=tolower($1)
+      if(t==alg_l || index(t,alg_l)==1){
+        n=0
+        for(i=NF;i>=1;i--){
+          if(isnum($i)){
+            a[3-n]=$i
+            n++
+            if(n==3) break
+          }
         }
-      }
-      if(n==3){
-        print a[1] "," a[2] "," a[3]
-        found=1
-        exit
+        if(n==3){
+          print a[1] "," a[2] "," a[3]
+          found=1
+          exit
+        }
       }
     }
     END{ exit(found?0:1) }
@@ -163,7 +175,7 @@ parse_pqc_row() {
 }
 
 # ---------- Start one long-lived container ----------
-echo "=== Signature speed (paper-grade, FINAL, ROBUST) ==="
+echo "=== Signature speed (paper-grade, ROBUST) ==="
 echo "mode=${MODE} repeats=${REPEATS} warmup=${WARMUP} seconds=${BENCH_SECONDS} STRICT=${STRICT}"
 echo "IMG=${IMG}"
 echo "RESULTS_DIR=${RESULTS_DIR}"
@@ -219,17 +231,85 @@ run_speed_pqc() {
   run_in_container "\"${OPENSSL}\" speed -seconds ${BENCH_SECONDS} -provider oqsprovider -provider default ${alg} 2>&1" || true
 }
 
+# ---------- Discover supported signature algorithms (oqsprovider) ----------
+echo "[INFO] $(ts) discovering supported signature algorithms (oqsprovider)..."
+sigalgs_out="$(run_in_container "\"${OPENSSL}\" list -signature-algorithms -provider oqsprovider -provider default 2>&1" || true)"
+printf "%s\n" "${sigalgs_out}" > "${supportlog}"
+
+# Build a lowercase set in a shell string for cheap membership test.
+# We store as " name1 name2 name3 " to allow substring-safe checks.
+supported_set=" "
+# Extract algorithm tokens from list output.
+# Typical formats:
+#   "mldsa44"
+#   "mldsa44 @ oqsprovider"
+#   "ECDSA"
+# We take the first field per non-empty line.
+while IFS= read -r line; do
+  # trim leading spaces
+  l="${line#"${line%%[![:space:]]*}"}"
+  [ -z "${l}" ] && continue
+  # ignore headers
+  case "${l}" in
+    *"Signature algorithms"*|*"Provided"*|*"providers"* ) continue ;;
+  esac
+  token="${l%%[[:space:]]*}"
+  token_l="$(printf "%s" "${token}" | tr '[:upper:]' '[:lower:]')"
+  supported_set+=" ${token_l} "
+done < "${supportlog}"
+
+is_supported_sigalg() {
+  local a_l
+  a_l="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "${supported_set}" == *" ${a_l} "* ]]
+}
+
+# Build final SIGS list:
+SIGS=()
+for a in "${SIGS_DESIRED[@]}"; do
+  if [ "${a}" = "ecdsap256" ]; then
+    SIGS+=("${a}")
+    continue
+  fi
+  if is_supported_sigalg "${a}"; then
+    SIGS+=("${a}")
+  else
+    # Not supported in this image/provider -> record a placeholder failure row for each repeat later
+    echo "[INFO] $(ts) alg not supported in this image: ${a}"
+  fi
+done
+
+echo "[INFO] $(ts) desired SIGS: ${SIGS_DESIRED[*]}"
+echo "[INFO] $(ts) bench SIGS (filtered): ${SIGS[*]}"
+echo "[INFO] $(ts) supported list saved to: ${supportlog}"
+
 # ---------- Warmup ----------
 echo "[INFO] $(ts) warmup=${WARMUP} (not recorded)"
 for _ in $(seq 1 "${WARMUP}"); do
   run_speed_ecdsa >/dev/null 2>&1 || true
-  for a in "mldsa44" "mldsa65" "falcon512" "falcon1024"; do
-    run_speed_pqc "$a" >/dev/null 2>&1 || true
+  for a in "${SIGS_DESIRED[@]}"; do
+    [ "${a}" = "ecdsap256" ] && continue
+    # Warmup only those supported, skip others
+    if is_supported_sigalg "${a}"; then
+      run_speed_pqc "$a" >/dev/null 2>&1 || true
+    fi
   done
 done
 
 # ---------- Main runs ----------
 for r in $(seq 1 "${REPEATS}"); do
+  # First, record rows for unsupported algs (so CSV shape is stable across runs)
+  for a in "${SIGS_DESIRED[@]}"; do
+    [ "${a}" = "ecdsap256" ] && continue
+    if ! is_supported_sigalg "${a}"; then
+      rawfile="${rawdir}/rep${r}_${a}.txt"
+      printf "%s\n" "UNSUPPORTED_ALGORITHM: ${a}" > "${rawfile}"
+      warn "Skipping unsupported algorithm (rep=${r} alg=${a}). See ${supportlog}"
+      record_row "${r}" "${a}" "" "" "" 0 "UNSUPPORTED_ALGORITHM" "${rawfile}"
+    fi
+  done
+
+  # Then, benchmark supported algs + ecdsa
   for alg in "${SIGS[@]}"; do
     rawfile="${rawdir}/rep${r}_${alg}.txt"
     echo "[RUN] rep=${r}/${REPEATS} alg=${alg}"
@@ -261,6 +341,13 @@ for r in $(seq 1 "${REPEATS}"); do
     out="$(run_speed_pqc "${alg}")"
     printf "%s\n" "${out}" > "${rawfile}"
 
+    # If openssl says unknown algorithm despite list support, record it explicitly.
+    if printf "%s\n" "${out}" | grep -qi "Unknown algorithm"; then
+      warn "openssl speed: Unknown algorithm (rep=${r} alg=${alg}) raw=${rawfile}"
+      record_row "${r}" "${alg}" "" "" "" 0 "UNKNOWN_ALGORITHM" "${rawfile}"
+      continue
+    fi
+
     keygens="" sign="" verify=""
     if IFS=',' read -r keygens sign verify < <(printf "%s\n" "${out}" | parse_pqc_row "${alg}"); then
       if isnum "${keygens}" && isnum "${sign}" && isnum "${verify}"; then
@@ -281,3 +368,10 @@ echo
 echo "CSV: ${csv}"
 echo "Raw: ${rawdir}/rep*_*.txt"
 echo "Warnings: ${warnlog}"
+echo "Supported alg list: ${supportlog}"
+
+# STRICT behavior: fail at the end if any warnings/errors happened.
+if [ "${STRICT}" = "1" ] && [ "${HAD_ERROR}" = "1" ]; then
+  echo "[ERROR] $(ts) STRICT=1: one or more algorithms failed/unsupported. See: ${warnlog}" 1>&2
+  exit 1
+fi
